@@ -838,7 +838,7 @@ def build_ui():
 
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="purple"),
                    css=CUSTOM_CSS, title="Regression Crew") as demo:
-        state = gr.State(_empty_state())
+        state = gr.State(None)
 
         gr.HTML(
             '<div class="main-header">'
@@ -1222,5 +1222,16 @@ _SCOPE_HTML = """
 
 
 if __name__ == "__main__":
+    try:
+        from gradio.blocks import Blocks as _GradioBlocks
+        _GradioBlocks.get_api_info = lambda self: {"named_endpoints": {}, "unnamed_endpoints": {}}
+    except Exception:
+        pass
+
     demo = build_ui()
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, show_error=True, show_api=False)
+    demo.queue(api_open=False).launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        show_error=True,
+        show_api=False,
+    )
