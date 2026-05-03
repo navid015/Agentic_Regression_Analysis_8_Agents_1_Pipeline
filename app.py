@@ -1222,18 +1222,34 @@ _SCOPE_HTML = """
 
 
 if __name__ == "__main__":
+    # The gradio_client utils crash on additionalProperties: True/False
+    # (a JSON Schema bool, not dict). We patch the two functions that don't
+    # check schema type before treating it as a dict, so they return "Any"
+    # instead of crashing. This is what newer gradio_client versions do.
     try:
-        from gradio.blocks import Blocks as _GradioBlocks
-        _GradioBlocks.get_api_info = lambda self: {
-            "named_endpoints": {}, "unnamed_endpoints": {}
-        }
+        from gradio_client import utils as _gc_utils
+
+        _orig_get_type = _gc_utils.get_type
+        _orig_recurse  = _gc_utils._json_schema_to_python_type
+
+        def _safe_get_type(schema):
+            if not isinstance(schema, dict):
+                return "Any"
+            return _orig_get_type(schema)
+
+        def _safe_recurse(schema, defs=None):
+            if not isinstance(schema, dict):
+                return "Any"
+            return _orig_recurse(schema, defs)
+
+        _gc_utils.get_type = _safe_get_type
+        _gc_utils._json_schema_to_python_type = _safe_recurse
     except Exception:
         pass
 
     demo = build_ui()
-    demo.queue(api_open=False).launch(
+    demo.queue().launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
-        show_api=False,
     )
