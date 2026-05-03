@@ -10,7 +10,7 @@ matplotlib>=3.8
 seaborn>=0.13
 
 # UI — Gradio (huggingface_hub pinned <1.0 — Gradio 4.x uses HfFolder which was removed in HH 1.0)
-gradio>=4.44.1,<5
+gradio>=4.44.0,<5
 huggingface_hub>=0.25,<1.0
 
 # Persistence

@@ -895,7 +895,6 @@ def build_ui():
                         gr.Markdown("### 2. Dataset preview (first 10 rows)")
                         preview_df = gr.DataFrame(
                             value=None, label=None, interactive=False, wrap=True,
-                            max_height=320,
                         )
 
                     with gr.Column(scale=2):
@@ -982,11 +981,11 @@ def build_ui():
             # =================== DATA & PREPROCESSING TAB ===================
             with gr.Tab("🧹 Data"):
                 gr.Markdown("### Dataset preview (first 10 rows)")
-                data_preview = gr.DataFrame(value=None, interactive=False, wrap=True, max_height=320)
+                data_preview = gr.DataFrame(value=None, interactive=False, wrap=True)
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### Column profile")
-                        profile_table = gr.DataFrame(interactive=False, wrap=True, max_height=420)
+                        profile_table = gr.DataFrame(interactive=False, wrap=True)
                     with gr.Column():
                         gr.Markdown("### Preprocessing summary")
                         preproc_summary = gr.Markdown()
@@ -1002,7 +1001,7 @@ def build_ui():
             with gr.Tab("🏁 Models"):
                 comparison_winners = gr.Markdown()
                 gr.HTML('<div class="section-header">All models — metrics</div>')
-                metrics_table = gr.DataFrame(interactive=False, wrap=True, max_height=420)
+                metrics_table = gr.DataFrame(interactive=False, wrap=True)
 
                 gr.HTML('<div class="section-header">Comparison charts</div>')
                 # One chart per row at full width — bar charts with model names
