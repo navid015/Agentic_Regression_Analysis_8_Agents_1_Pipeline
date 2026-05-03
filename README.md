@@ -10,7 +10,6 @@ pinned: false
 license: mit
 ---
 
-
 # 📈 Regression Crew
 
 End-to-end agentic regression analysis built with **CrewAI** and **Gradio**.
