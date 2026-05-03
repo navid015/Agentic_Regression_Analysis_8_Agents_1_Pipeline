@@ -15,6 +15,7 @@ huggingface_hub>=0.25,<1.0
 
 
 pydantic>=2.0,<2.11
+starlette<1.0
 
 # Persistence
 joblib>=1.3
