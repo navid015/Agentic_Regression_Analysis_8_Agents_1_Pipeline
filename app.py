@@ -1223,4 +1223,8 @@ _SCOPE_HTML = """
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.queue().launch(share=True, show_error=True)
+    # `share=True` tries to open an outbound tunnel to Gradio's proxy service —
+    # inside the HF Spaces container this either fails or stalls, and Spaces'
+    # health check never sees the app come up (`Launch timed out, workload was
+    # not healthy after 30 min`). Bind directly to the port Spaces proxies to.
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, show_error=True)

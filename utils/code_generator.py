@@ -166,8 +166,13 @@ if AUTO_DROP_ID_COLUMNS:
 # ---------------------------------------------------------------------
 # 2. AUTO DATETIME FEATURE EXTRACTION
 # ---------------------------------------------------------------------
-def extract_datetime(frame, cols):
+def extract_datetime(frame, cols, hour_cols=None):
+    # `hour_cols`, when given, forces hour-feature inclusion for exactly those
+    # columns instead of deciding per-frame — deciding independently per split
+    # can add "<col>_hour" to train's schema but not test's (or vice versa),
+    # which then crashes ColumnTransformer.transform with a missing-column error.
     out = frame.copy()
+    used_hour_cols = set()
     for col in cols:
         if col not in out.columns:
             continue
@@ -176,10 +181,13 @@ def extract_datetime(frame, cols):
         out[f"{{col}}_month"]   = parsed.dt.month
         out[f"{{col}}_day"]     = parsed.dt.day
         out[f"{{col}}_weekday"] = parsed.dt.weekday
-        if parsed.dt.hour.fillna(0).sum() > 0:
+        include_hour = (col in hour_cols) if hour_cols is not None \
+            else (parsed.dt.hour.fillna(0).sum() > 0)
+        if include_hour:
             out[f"{{col}}_hour"] = parsed.dt.hour
+            used_hour_cols.add(col)
         out = out.drop(columns=[col])
-    return out
+    return out, used_hour_cols
 
 datetime_cols = []
 if AUTO_DATETIME_FEATURES:
@@ -193,9 +201,9 @@ if AUTO_DATETIME_FEATURES:
             if parsed.notna().sum() / max(s.notna().sum(), 1) > 0.85:
                 datetime_cols.append(col)
     if datetime_cols:
-        df_train = extract_datetime(df_train, datetime_cols)
-        if df_val  is not None: df_val  = extract_datetime(df_val,  datetime_cols)
-        if df_test is not None: df_test = extract_datetime(df_test, datetime_cols)
+        df_train, datetime_hour_cols = extract_datetime(df_train, datetime_cols)
+        if df_val  is not None: df_val,  _ = extract_datetime(df_val,  datetime_cols, hour_cols=datetime_hour_cols)
+        if df_test is not None: df_test, _ = extract_datetime(df_test, datetime_cols, hour_cols=datetime_hour_cols)
         print(f"Extracted datetime features from: {{datetime_cols}}")
 
 # ---------------------------------------------------------------------

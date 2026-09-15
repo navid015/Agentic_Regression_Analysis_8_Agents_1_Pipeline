@@ -143,9 +143,21 @@ def profile_dataframe(df: pd.DataFrame, target: str) -> dict[str, Any]:
 # ---- datetime feature extraction --------------------------------------------
 
 
-def _extract_datetime_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """For each datetime column, replace it with year/month/day/weekday/hour."""
+def _extract_datetime_features(df: pd.DataFrame, cols: list[str],
+                                hour_cols: set[str] | None = None
+                                ) -> tuple[pd.DataFrame, set[str]]:
+    """For each datetime column, replace it with year/month/day/weekday/hour.
+
+    `hour_cols`, when given, forces hour-feature inclusion for exactly those
+    columns instead of deciding per-frame. Deciding independently for train
+    vs. val/test (e.g. "does this split have any non-midnight timestamps?")
+    can add `_hour` to one split's schema but not another's, which then
+    crashes `ColumnTransformer.transform` with a missing-column error. Always
+    derive `hour_cols` from the training frame and pass it to every other
+    frame so the extracted feature set matches across splits.
+    """
     out = df.copy()
+    used_hour_cols: set[str] = set()
     for col in cols:
         if col not in out.columns:
             continue
@@ -154,11 +166,13 @@ def _extract_datetime_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFram
         out[f"{col}_month"]   = parsed.dt.month
         out[f"{col}_day"]     = parsed.dt.day
         out[f"{col}_weekday"] = parsed.dt.weekday
-        # only add hour if at least some values have non-zero hours
-        if parsed.dt.hour.fillna(0).sum() > 0:
+        include_hour = (col in hour_cols) if hour_cols is not None \
+            else (parsed.dt.hour.fillna(0).sum() > 0)
+        if include_hour:
             out[f"{col}_hour"] = parsed.dt.hour
+            used_hour_cols.add(col)
         out = out.drop(columns=[col])
-    return out
+    return out, used_hour_cols
 
 
 def _frequency_encode_inplace(df: pd.DataFrame, col: str, lookup: pd.Series | None = None
@@ -238,9 +252,9 @@ def preprocess(
         protected = {time_column} if (split_strategy == "time" and time_column) else set()
         datetime_cols_used = [c for c in profile["datetime_candidates"] if c not in protected]
         if datetime_cols_used:
-            df = _extract_datetime_features(df, datetime_cols_used)
-            if df_val  is not None: df_val  = _extract_datetime_features(df_val,  datetime_cols_used)
-            if df_test is not None: df_test = _extract_datetime_features(df_test, datetime_cols_used)
+            df, hour_cols = _extract_datetime_features(df, datetime_cols_used)
+            if df_val  is not None: df_val,  _ = _extract_datetime_features(df_val,  datetime_cols_used, hour_cols=hour_cols)
+            if df_test is not None: df_test, _ = _extract_datetime_features(df_test, datetime_cols_used, hour_cols=hour_cols)
 
     # step 3: optional drop of zero-variance columns
     dropped_lowvar: list[str] = []

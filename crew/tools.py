@@ -195,11 +195,25 @@ def quality_review_tool(_: str = "") -> str:
     p = STATE["profile"]; pre = STATE["preprocessing"]; results = STATE["results"]
     df_train = STATE["df_train"]; target = STATE["target"]
 
+    # Columns the pipeline already excluded from training (auto-dropped ID/index
+    # columns, low-variance columns, the group column) shouldn't be flagged as
+    # leakage — they carry no signal into any trained model, so a high raw
+    # correlation there is a non-issue, not a red flag.
+    excluded_cols: set = set()
+    if pre is not None:
+        s = pre.summary
+        excluded_cols.update(s.get("id_like_columns_dropped") or [])
+        excluded_cols.update(s.get("low_variance_dropped") or [])
+        if s.get("group_column"):
+            excluded_cols.add(s["group_column"])
+    if STATE.get("time_column"):
+        excluded_cols.add(STATE["time_column"])
+
     # Primary leakage signal: any single feature nearly perfectly correlated with target
     leaked_features: list[tuple[str, float]] = []
     if df_train is not None and target is not None:
         for col in df_train.columns:
-            if col == target:
+            if col == target or col in excluded_cols:
                 continue
             if pd.api.types.is_numeric_dtype(df_train[col]):
                 try:
