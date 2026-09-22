@@ -11,6 +11,7 @@ from typing import Any
 
 def _model_construction_lines(model_names: list[str], use_xgb: bool, use_lgbm: bool) -> str:
     template = {
+        "Baseline (mean)":  "DummyRegressor(strategy='mean')",
         "LinearRegression": "LinearRegression()",
         "Ridge":            "Ridge(alpha=1.0, random_state=RANDOM_STATE)",
         "Lasso":            "Lasso(alpha=0.01, random_state=RANDOM_STATE, max_iter=10000)",
@@ -49,6 +50,7 @@ def generate_python_script(
     auto_datetime_features: bool = True,
     drop_low_variance: bool = True,
     auto_drop_id_columns: bool = True,
+    drop_duplicate_rows: bool = True,
     time_column: str | None = None,
     group_column: str | None = None,
     summary: dict[str, Any] | None = None,
@@ -84,6 +86,7 @@ Pipeline summary from the original UI run:
 import warnings
 warnings.filterwarnings("ignore")
 
+import re
 import time
 import numpy as np
 import pandas as pd
@@ -102,6 +105,8 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.svm import SVR
+from sklearn.dummy import DummyRegressor
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (mean_absolute_error, mean_squared_error,
                              median_absolute_error, r2_score)
 {extra_imports}
@@ -120,10 +125,14 @@ LOG_TARGET   = {log_target}
 AUTO_DATETIME_FEATURES = {auto_datetime_features}
 DROP_LOW_VARIANCE      = {drop_low_variance}
 AUTO_DROP_ID_COLUMNS   = {auto_drop_id_columns}
+DROP_DUPLICATE_ROWS    = {drop_duplicate_rows}
 TIME_COLUMN  = {time_column!r}
 GROUP_COLUMN = {group_column!r}
 HIGH_CARDINALITY_THRESHOLD = 20
-ID_COLUMN_NAME_HINTS = ("unnamed:", "id", "index", "rowid", "row_id", "row_num", "_id")
+# Whole-token identifier names. Matched against TOKENS, never as substrings:
+# a substring test flags (and deletes) fixed_acidity, humidity, width, solidity.
+ID_COLUMN_NAME_TOKENS = {{"id", "ids", "index", "idx", "rowid", "row", "rownum",
+                         "rownumber", "key", "pk", "uuid", "guid", "serial", "seq"}}
 
 # ---------------------------------------------------------------------
 # 1. LOAD
@@ -135,27 +144,61 @@ print(f"Train: {{df_train.shape}}")
 if df_val  is not None: print(f"Val:   {{df_val.shape}}")
 if df_test is not None: print(f"Test:  {{df_test.shape}}")
 
+# replace +/-inf with NaN (SimpleImputer does NOT treat inf as missing, so an
+# infinity survives imputation and turns a whole scaled column into NaN)
+def sanitize_inf(frame):
+    num = frame.select_dtypes(include=[np.number]).columns
+    if len(num): frame = frame.copy(); frame[num] = frame[num].replace([np.inf, -np.inf], np.nan)
+    return frame
+
+df_train = sanitize_inf(df_train)
+if df_val  is not None: df_val  = sanitize_inf(df_val)
+if df_test is not None: df_test = sanitize_inf(df_test)
+
 # drop rows where target is missing
 df_train = df_train.dropna(subset=[TARGET])
 if df_val  is not None: df_val  = df_val.dropna(subset=[TARGET])
 if df_test is not None: df_test = df_test.dropna(subset=[TARGET])
 assert pd.api.types.is_numeric_dtype(df_train[TARGET]), "Target must be numeric."
 
+# drop exact duplicate rows BEFORE splitting - identical rows on both sides of
+# the split mean the model has literally already seen the answer
+if DROP_DUPLICATE_ROWS and df_test is None:
+    _before = len(df_train)
+    df_train = df_train.drop_duplicates().reset_index(drop=True)
+    if _before != len(df_train):
+        print(f"Dropped {{_before - len(df_train)}} exact duplicate rows")
+
 # ---------------------------------------------------------------------
 # 1.5 DROP ID-LIKE COLUMNS (e.g. pandas' "Unnamed: 0" — leaks when sorted)
 # ---------------------------------------------------------------------
+def all_unique(s):
+    non_null = int(s.notna().sum())
+    return non_null > 0 and int(s.nunique(dropna=True)) == non_null
+
+def name_suggests_id(col):
+    lowered = str(col).lower().strip()
+    if lowered.startswith("unnamed:"): return True
+    tokens = {{t for t in re.split(r"[^a-z0-9]+", lowered) if t}}
+    return bool(tokens & ID_COLUMN_NAME_TOKENS)
+
 def is_id_like(s):
     if not pd.api.types.is_numeric_dtype(s): return False
-    if s.nunique(dropna=True) != s.notna().sum(): return False
+    if not all_unique(s): return False
     arr = s.dropna().to_numpy()
     if not np.all(arr == arr.astype(np.int64)): return False
     return s.is_monotonic_increasing or s.is_monotonic_decreasing
 
+def looks_like_identifier(col, s):
+    # A name hint alone is never enough to delete a column - the values must
+    # actually behave like identifiers (all distinct).
+    return is_id_like(s) or (name_suggests_id(col) and all_unique(s))
+
 if AUTO_DROP_ID_COLUMNS:
     id_cols = []
     for col in df_train.columns:
-        if col == TARGET or col == TIME_COLUMN: continue
-        if any(h in col.lower() for h in ID_COLUMN_NAME_HINTS) or is_id_like(df_train[col]):
+        if col == TARGET or col == TIME_COLUMN or col == GROUP_COLUMN: continue
+        if looks_like_identifier(col, df_train[col]):
             id_cols.append(col)
     if id_cols:
         df_train = df_train.drop(columns=id_cols)
@@ -269,16 +312,33 @@ for col in X_train.columns:
     else:
         low_card_cat.append(col)
 
-# frequency-encode high-card categoricals using TRAIN frequencies
-for col in high_card_cat:
-    freq = X_train[col].astype(object).value_counts(normalize=True)
-    X_train[col] = X_train[col].map(freq).fillna(0.0)
-    X_test [col] = X_test [col].map(freq).fillna(0.0)
-    if X_val is not None:
-        X_val[col] = X_val[col].map(freq).fillna(0.0)
-    numeric_cols.append(col)
+# Frequency encoding lives INSIDE the pipeline so the fitted lookups are
+# pickled with the preprocessor. Kept as a loose loop, the mapping was never
+# saved and best_model.joblib could not transform new raw data on its own.
+class FrequencyEncoder(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.lookups_ = {{c: X[c].astype(object).value_counts(normalize=True)
+                         for c in X.columns}}
+        return self
+    def transform(self, X):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        out = pd.DataFrame(index=X.index)
+        for c in self.feature_names_in_:
+            out[c] = X[c].astype(object).map(self.lookups_[c]).astype("float64").fillna(0.0)
+        return out.to_numpy(dtype="float64")
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_in_, dtype=object)
+
+class InfinityToNaN(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None): return self
+    def transform(self, X):
+        arr = np.asarray(X, dtype="float64")
+        return np.where(np.isfinite(arr), arr, np.nan)
 
 numeric_pipe = Pipeline([
+    ("finite", InfinityToNaN()),
     ("impute", SimpleImputer(strategy="median")),
     ("scale",  StandardScaler()),
 ])
@@ -286,9 +346,14 @@ cat_pipe = Pipeline([
     ("impute", SimpleImputer(strategy="most_frequent")),
     ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
 ])
+freq_pipe = Pipeline([
+    ("freq",  FrequencyEncoder()),
+    ("scale", StandardScaler()),
+])
 transformers = []
-if numeric_cols:  transformers.append(("num", numeric_pipe, numeric_cols))
-if low_card_cat:  transformers.append(("cat", cat_pipe,     low_card_cat))
+if numeric_cols:  transformers.append(("num",  numeric_pipe, numeric_cols))
+if low_card_cat:  transformers.append(("cat",  cat_pipe,     low_card_cat))
+if high_card_cat: transformers.append(("freq", freq_pipe,    high_card_cat))
 preprocessor = ColumnTransformer(transformers, remainder="drop")
 
 X_train = preprocessor.fit_transform(X_train)
@@ -358,7 +423,9 @@ metrics_df = pd.DataFrame(
 ).sort_values("RMSE")
 print("\\n=== Model comparison (sorted by RMSE) ===")
 print(metrics_df.to_string(index=False))
-best_name = metrics_df.iloc[0]["Model"]
+_ranked = metrics_df[metrics_df["Model"] != "Baseline (mean)"]
+if len(_ranked) == 0: _ranked = metrics_df
+best_name = _ranked.iloc[0]["Model"]
 print(f"\\n>>> Best model: {{best_name}}")
 
 # ---------------------------------------------------------------------
