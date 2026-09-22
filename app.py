@@ -421,14 +421,19 @@ def _status_banner(kind: str, message: str) -> str:
 # How many output components come AFTER (status_banner, state, timeline_display).
 # These are all the result components from _render_results — we provide gr.update()
 # placeholders during in-progress yields so they don't get reset.
-_NUM_RESULT_OUTPUTS = 31
+#
+# This is a fallback only: build_ui() overwrites it with len(run_outputs) - 3 once
+# the components exist. It used to be a hand-maintained constant, so adding a
+# single chart raised a count-mismatch error at runtime rather than at import.
+_NUM_RESULT_OUTPUTS = 32
 
 
 def on_run(
     mode, target, time_col, group_col,
     test_size, random_state, n_folds,
     selected_models, split_strategy, log_target,
-    auto_datetime, drop_lowvar, drop_id_cols, tune_hyperparams, use_agents,
+    auto_datetime, drop_lowvar, drop_id_cols, drop_dupes, missing_flags,
+    tune_hyperparams, use_agents,
     state,
 ):
     """Generator: streams timeline updates while the pipeline runs on a thread."""
@@ -448,6 +453,16 @@ def on_run(
         return
     if not selected_models:
         yield (_status_banner("error", "❌ <b>No models selected</b> — pick at least one in Setup."),
+               state, gr.update(), *placeholders)
+        return
+    # A time-aware split with no time column silently degrades to a random split.
+    # On time-ordered data that is the single most expensive mistake this tool can
+    # make on the user's behalf, so refuse rather than fall back quietly.
+    if split_strategy == "Time-aware" and time_col in (None, "(none)"):
+        yield (_status_banner("error",
+                              "❌ <b>Time-aware split needs a time column</b> — pick one under "
+                              "<i>Optional: time / group columns</i> in Setup, or switch the "
+                              "split strategy back to Random."),
                state, gr.update(), *placeholders)
         return
 
@@ -506,6 +521,8 @@ def on_run(
                 auto_datetime_features=auto_datetime,
                 drop_low_variance=drop_lowvar,
                 auto_drop_id_columns=drop_id_cols,
+                drop_duplicate_rows=drop_dupes,
+                add_missing_indicators=missing_flags,
                 tune_hyperparameters=tune_hyperparams,
                 use_agents=use_agents,
                 progress_callback=progress_cb,
@@ -679,17 +696,37 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
             "RMSE (train)": round(m.get("RMSE_train", float("nan")), 4),
             "CV R² mean":   round(m.get("CV_R2_mean", float("nan")), 4),
             "CV R² std":    round(m.get("CV_R2_std", float("nan")), 4),
+            "RMSE (val)":   round(m.get("RMSE_val", float("nan")), 4),
+            "R² (val)":     round(m.get("R2_val", float("nan")), 4),
             "Train time (s)": round(r.train_time_sec, 3),
+            "Tuned params": ("" if not r.best_params else
+                             ", ".join(f"{k}={v}" for k, v in r.best_params.items())),
         })
     metrics_df = pd.DataFrame(metrics_rows).sort_values("RMSE").reset_index(drop=True)
+    # Hide columns that carry no information for this run (no validation set
+    # supplied, or tuning switched off) rather than showing a wall of NaN.
+    for _col in ("RMSE (val)", "R² (val)"):
+        if _col in metrics_df and metrics_df[_col].isna().all():
+            metrics_df = metrics_df.drop(columns=[_col])
+    if "Tuned params" in metrics_df and not metrics_df["Tuned params"].str.strip().any():
+        metrics_df = metrics_df.drop(columns=["Tuned params"])
 
     # build a markdown header above the table indicating winners — avoids
     # the unreadable-highlight issue from the Streamlit version
     best_rmse = metrics_df.loc[metrics_df["RMSE"].idxmin(), "Model"]
     best_mae  = metrics_df.loc[metrics_df["MAE"].idxmin(),  "Model"]
     best_r2   = metrics_df.loc[metrics_df["R²"].idxmax(),   "Model"]
+    basis = getattr(out, "selection_basis", "test")
+    basis_note = (
+        "selected on the **validation** set, so the test metrics below remain an "
+        "unbiased estimate"
+        if basis == "validation" else
+        "selected on the **test** set — no validation file was supplied, so the "
+        "winner's test score is mildly optimistic"
+    )
     winners_md = (
-        f"🏆 **Best by RMSE:** `{best_rmse}` &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"🏆 **Overall winner:** `{best}` — {basis_note}.\n\n"
+        f"**Best by RMSE:** `{best_rmse}` &nbsp;&nbsp;|&nbsp;&nbsp; "
         f"**Best by MAE:** `{best_mae}` &nbsp;&nbsp;|&nbsp;&nbsp; "
         f"**Best by R²:** `{best_r2}`"
     )
@@ -753,6 +790,7 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         gr.update(value=out.generated_script),      # code preview
         gr.update(value=str(py_path)),              # py download
         gr.update(value=str(nb_path)),              # ipynb download
+        gr.update(value=out.model_bundle_path),     # best_model.joblib download
         gr.update(value=code_md),                   # code commentary
         gr.update(value=nar_md),                    # full narrative
     )
@@ -933,6 +971,8 @@ def build_ui():
                             auto_dt_cb        = gr.Checkbox(True,  label="Auto-extract datetime features")
                             drop_lowvar_cb    = gr.Checkbox(True,  label="Drop low-variance columns")
                             drop_id_cb        = gr.Checkbox(True,  label="Auto-drop ID/row-index columns (recommended — prevents subtle leakage when data is sorted)")
+                            drop_dupes_cb     = gr.Checkbox(True,  label="Drop exact duplicate rows before splitting (recommended — duplicates across the split leak the answer)")
+                            missing_flags_cb  = gr.Checkbox(False, label="Add missing-value indicator features (missingness is often informative)")
                             tune_cb           = gr.Checkbox(False, label="Hyperparameter tuning (slower)")
 
                         gr.Markdown("### 5. CrewAI agent narration")
@@ -1045,6 +1085,21 @@ def build_ui():
                 with gr.Row():
                     py_download = gr.File(label="📜 regression_pipeline.py", interactive=False)
                     nb_download = gr.File(label="📓 regression_pipeline.ipynb", interactive=False)
+                    bundle_download = gr.File(label="📦 best_model.joblib", interactive=False)
+                gr.Markdown(
+                    "`best_model.joblib` holds the fitted preprocessor **and** the winning "
+                    "model in one object. Because every learned mapping (imputation, scaling, "
+                    "one-hot and frequency encoding) lives inside the preprocessor, it "
+                    "transforms raw data on its own:\n\n"
+                    "```python\n"
+                    "import joblib, pandas as pd\n"
+                    "b = joblib.load('best_model.joblib')\n"
+                    "X = b['preprocessor'].transform(pd.read_csv('new_rows.csv'))\n"
+                    "pred = b['model'].predict(X)\n"
+                    "if b['target_transform'] == 'log1p':\n"
+                    "    import numpy as np; pred = np.expm1(pred)\n"
+                    "```"
+                )
                 code_preview = gr.Code(language="python", label="Generated Python script", lines=25)
                 with gr.Accordion("💻 Code Generator Agent commentary", open=False):
                     code_commentary = gr.Markdown()
@@ -1083,7 +1138,7 @@ def build_ui():
             model_dropdown, pm_metrics,
             pm_plot1, pm_plot2, pm_plot3, pm_plot4, pm_plot5, pm_plot6,
             # Code
-            code_preview, py_download, nb_download, code_commentary,
+            code_preview, py_download, nb_download, bundle_download, code_commentary,
             # Narrative
             narrative_md,
         ]
@@ -1092,8 +1147,13 @@ def build_ui():
             upload_mode, target_dd, time_dd, group_dd,
             test_size, random_state, n_folds,
             models_cb, split_strategy, log_target_cb,
-            auto_dt_cb, drop_lowvar_cb, drop_id_cb, tune_cb, use_agents_cb, state,
+            auto_dt_cb, drop_lowvar_cb, drop_id_cb, drop_dupes_cb, missing_flags_cb,
+            tune_cb, use_agents_cb, state,
         ]
+
+        # Keep the placeholder count in lockstep with the real component list.
+        global _NUM_RESULT_OUTPUTS
+        _NUM_RESULT_OUTPUTS = len(run_outputs) - 3  # status_banner, state, timeline
 
         # Wire both run buttons (Setup tab and Overview tab) to the same handler
         run_btn.click(on_run, run_inputs, run_outputs)
