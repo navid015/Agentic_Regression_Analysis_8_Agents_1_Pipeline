@@ -14,21 +14,95 @@ Preprocessing for regression — supports:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 HIGH_CARDINALITY_THRESHOLD = 20
 LOW_VARIANCE_NUNIQUE = 1  # column has only 1 unique value -> drop
+NEAR_CONSTANT_FREQ = 0.999  # single value covers >=99.9% of rows -> effectively constant
 LOG_TRANSFORM_SKEW_THRESHOLD = 1.5  # |skew| above this triggers auto log-suggestion
-ID_COLUMN_NAME_HINTS = ("unnamed:", "id", "index", "rowid", "row_id", "row_num", "_id")
+
+# Whole-token names that mean "this is a row identifier".
+#
+# These are matched against TOKENS of the column name, never as substrings.
+# The previous substring check ("id" in col.lower()) silently flagged - and
+# therefore dropped - ordinary features such as fixed_acidity, volatile_acidity,
+# citric_acid, residual_sugar, humidity, width, solidity and confidence. On the
+# wine-quality dataset that removed four of eleven real features before training.
+ID_COLUMN_NAME_TOKENS = frozenset({
+    "id", "ids", "index", "idx", "rowid", "row", "rownum", "rownumber",
+    "key", "pk", "uuid", "guid", "serial", "seq",
+})
+ID_COLUMN_NAME_PREFIXES = ("unnamed:",)
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _name_suggests_id(col: str) -> bool:
+    """True only when a WHOLE TOKEN of the column name means 'identifier'.
+
+    'customer_id' -> tokens {customer, id} -> True
+    'fixed_acidity' -> tokens {fixed, acidity} -> False
+    'Unnamed: 0' -> prefix match -> True
+    """
+    lowered = str(col).lower().strip()
+    if any(lowered.startswith(p) for p in ID_COLUMN_NAME_PREFIXES):
+        return True
+    tokens = {t for t in _TOKEN_SPLIT_RE.split(lowered) if t}
+    return bool(tokens & ID_COLUMN_NAME_TOKENS)
+
+
+def _is_low_variance(s: pd.Series) -> bool:
+    """Constant, all-null, or near-constant columns carry no usable signal.
+
+    The original check only caught nunique <= 1. A column where 99.9% of rows
+    share one value is statistically just as useless but survived that test,
+    then went on to consume a one-hot slot or distort a scaler.
+    """
+    non_null = int(s.notna().sum())
+    if non_null == 0:
+        return True
+    if int(s.nunique(dropna=True)) <= LOW_VARIANCE_NUNIQUE:
+        return True
+    try:
+        top_share = float(s.value_counts(dropna=True).iloc[0]) / float(len(s))
+    except Exception:
+        return False
+    return top_share >= NEAR_CONSTANT_FREQ
+
+
+def _all_values_unique(s: pd.Series) -> bool:
+    non_null = int(s.notna().sum())
+    return non_null > 0 and int(s.nunique(dropna=True)) == non_null
+
+
+def _looks_like_identifier(col: str, s: pd.Series) -> bool:
+    """Decide whether a column is a row identifier that must not be a feature.
+
+    Two independent routes, and BOTH require the values to actually behave like
+    identifiers - a name hint alone is never enough to delete a column:
+
+      1. Structural: numeric, all-unique, integer-valued, monotonic. This is the
+         leftover-row-index case (pandas' "Unnamed: 0" on a target-sorted CSV).
+      2. Name token + all values unique. Catches 'customer_id' holding random
+         unique ints or strings, which is not monotonic and so fails route 1.
+
+    A column named 'store_id' with repeated values is NOT an identifier here -
+    it is a legitimate categorical / grouping key, and dropping it would throw
+    away real signal.
+    """
+    if _is_id_like_column(s):
+        return True
+    return _name_suggests_id(col) and _all_values_unique(s)
 
 
 def _is_id_like_column(s: pd.Series) -> bool:
@@ -101,9 +175,9 @@ def profile_dataframe(df: pd.DataFrame, target: str) -> dict[str, Any]:
             "missing_pct": round(float(s.isna().mean() * 100), 2),
             "unique": int(s.nunique(dropna=True)),
         }
-        # ID-like detection: name hint OR sequential integer pattern
-        name_hint = any(h in col.lower() for h in ID_COLUMN_NAME_HINTS)
-        if name_hint or _is_id_like_column(s):
+        # ID-like detection: structural pattern, or an identifier-style NAME
+        # backed by all-unique values. A name hint alone never qualifies.
+        if _looks_like_identifier(col, s):
             info["kind"] = "id_like"
             profile["id_like_columns"].append(col)
             profile["columns"].append(info)
@@ -134,7 +208,7 @@ def profile_dataframe(df: pd.DataFrame, target: str) -> dict[str, Any]:
                     # remove from high-cardinality list since it's actually a datetime
                     if col in profile["high_cardinality_columns"]:
                         profile["high_cardinality_columns"].remove(col)
-        if info["unique"] <= LOW_VARIANCE_NUNIQUE:
+        if _is_low_variance(s):
             profile["low_variance_columns"].append(col)
         profile["columns"].append(info)
     return profile
@@ -175,15 +249,97 @@ def _extract_datetime_features(df: pd.DataFrame, cols: list[str],
     return out, used_hour_cols
 
 
-def _frequency_encode_inplace(df: pd.DataFrame, col: str, lookup: pd.Series | None = None
-                              ) -> pd.Series:
-    """Frequency-encode a column. If `lookup` given, use it (for val/test)."""
-    if lookup is None:
-        counts = df[col].value_counts(normalize=True)
-    else:
-        counts = lookup
-    df[col] = df[col].map(counts).fillna(0.0)
-    return counts
+class InfinityToNaN(BaseEstimator, TransformerMixin):
+    """Convert +/-inf to NaN so the downstream imputer can handle it.
+
+    This lives INSIDE the pipeline rather than only in preprocess(), because
+    otherwise the persisted artifact would still crash on inference data
+    containing infinities - sklearn's imputer rejects non-finite input.
+    """
+
+    def fit(self, X, y=None):
+        self.n_features_in_ = np.asarray(X).shape[1] if np.ndim(X) > 1 else 1
+        return self
+
+    def transform(self, X):
+        arr = np.asarray(X, dtype="float64")
+        return np.where(np.isfinite(arr), arr, np.nan)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(input_features, dtype=object)
+
+
+class FrequencyEncoder(BaseEstimator, TransformerMixin):
+    """Map each category to its relative frequency in the TRAINING data.
+
+    Why this is a transformer rather than a loose helper: previously the
+    frequency lookups lived in a local dict and were never stored on the fitted
+    ColumnTransformer. That meant the persisted artifact (preprocessor + model)
+    could not transform new raw data containing high-cardinality categoricals -
+    the mapping simply wasn't saved. Implementing fit/transform puts the lookups
+    inside the pipeline, so they are pickled with everything else.
+
+    Unseen categories map to 0.0 (they were never observed in training).
+    """
+
+    def fit(self, X, y=None):
+        X = self._as_frame(X)
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.n_features_in_ = X.shape[1]
+        self.lookups_ = {
+            col: X[col].astype(object).value_counts(normalize=True)
+            for col in X.columns
+        }
+        return self
+
+    def transform(self, X):
+        X = self._as_frame(X)
+        out = pd.DataFrame(index=X.index)
+        for col in self.feature_names_in_:
+            lookup = self.lookups_[col]
+            out[col] = (
+                X[col].astype(object).map(lookup).astype("float64").fillna(0.0)
+            )
+        return out.to_numpy(dtype="float64")
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_in_, dtype=object)
+
+    @staticmethod
+    def _as_frame(X):
+        return X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
+
+def _feature_names_from(preprocessor: ColumnTransformer,
+                        numeric_cols: list[str],
+                        low_card_cat: list[str],
+                        high_card_cat: list[str]) -> list[str]:
+    """Read output feature names off the fitted ColumnTransformer.
+
+    Falls back to manual reconstruction only if the sklearn version in use
+    cannot report them.
+    """
+    try:
+        raw = list(preprocessor.get_feature_names_out())
+        cleaned = []
+        for name in raw:
+            text = str(name)
+            for prefix in ("num__", "cat__", "freq__"):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            cleaned.append(text)
+        return cleaned
+    except Exception:
+        names = list(numeric_cols)
+        if low_card_cat:
+            try:
+                ohe = preprocessor.named_transformers_["cat"].named_steps["encode"]
+                names.extend(ohe.get_feature_names_out(low_card_cat).tolist())
+            except Exception:
+                names.extend(low_card_cat)
+        names.extend(high_card_cat)
+        return names
 
 
 # ---- main preprocessing API -------------------------------------------------
@@ -204,6 +360,8 @@ def preprocess(
     auto_datetime_features: bool = True,
     drop_low_variance: bool = True,
     auto_drop_id_columns: bool = True,
+    drop_duplicate_rows: bool = True,
+    add_missing_indicators: bool = False,
 ) -> PreprocessingResult:
     """End-to-end preprocessing.
 
@@ -222,10 +380,39 @@ def preprocess(
     if df_val is not None and target not in df_val.columns:
         raise ValueError(f"Target '{target}' missing from the validation file.")
 
+    # step 0b: replace +/-inf with NaN so the imputer can actually handle them.
+    # SimpleImputer does NOT treat inf as missing, so an infinity survived
+    # imputation and then turned an entire scaled column into NaN downstream.
+    def _sanitize_inf(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+        numeric = frame.select_dtypes(include=[np.number]).columns
+        if len(numeric) == 0:
+            return frame, 0
+        mask = np.isinf(frame[numeric].to_numpy(dtype="float64", na_value=np.nan))
+        count = int(mask.sum())
+        if count:
+            frame = frame.copy()
+            frame[numeric] = frame[numeric].replace([np.inf, -np.inf], np.nan)
+        return frame, count
+
+    df, n_inf = _sanitize_inf(df)
+    if df_val is not None:
+        df_val, extra = _sanitize_inf(df_val);  n_inf += extra
+    if df_test is not None:
+        df_test, extra = _sanitize_inf(df_test); n_inf += extra
+
     # step 1: drop rows where target is NaN (in every provided frame)
     df = df.dropna(subset=[target]).copy()
     if df_val  is not None: df_val  = df_val.dropna(subset=[target]).copy()
     if df_test is not None: df_test = df_test.dropna(subset=[target]).copy()
+
+    # step 1b: drop exact duplicate rows BEFORE splitting.
+    # Identical rows landing on both sides of the split mean the model has
+    # literally already seen the answer, which inflates every test metric.
+    n_duplicates_dropped = 0
+    if drop_duplicate_rows:
+        before = len(df)
+        df = df.drop_duplicates().reset_index(drop=True)
+        n_duplicates_dropped = before - len(df)
 
     # step 2: optional datetime feature extraction (apply identically to all frames).
     # IMPORTANT: do not extract from `time_column` if a time-aware split is requested —
@@ -262,7 +449,9 @@ def preprocess(
         for col in list(df.columns):
             if col == target:
                 continue
-            if df[col].nunique(dropna=True) <= LOW_VARIANCE_NUNIQUE:
+            if col in (time_column, group_column):
+                continue  # needed for splitting / CV, not used as a feature
+            if _is_low_variance(df[col]):
                 dropped_lowvar.append(col)
         if dropped_lowvar:
             df = df.drop(columns=dropped_lowvar)
@@ -289,6 +478,20 @@ def preprocess(
                 cut = int(len(df_sorted) * (1 - test_size))
                 train_df, test_df = df_sorted.iloc[:cut], df_sorted.iloc[cut:]
                 split_used = f"time-aware (sorted by '{time_column}')"
+        elif group_column and group_column in df.columns:
+            # Group-aware split. Previously the group column only protected the
+            # CV folds, while the train/test split was still plain random - so
+            # the same patient / store / user could appear on both sides and the
+            # test score measured memorisation rather than generalisation.
+            splitter = GroupShuffleSplit(
+                n_splits=1, test_size=test_size, random_state=random_state
+            )
+            train_idx, test_idx = next(
+                splitter.split(df, groups=df[group_column].to_numpy())
+            )
+            train_df = df.iloc[train_idx].reset_index(drop=True)
+            test_df  = df.iloc[test_idx].reset_index(drop=True)
+            split_used = f"group-aware (grouped by '{group_column}')"
         else:
             train_df, test_df = train_test_split(
                 df, test_size=test_size, random_state=random_state
@@ -331,31 +534,34 @@ def preprocess(
         else:
             low_card_cat.append(col)
 
-    # step 7: frequency-encode high-card categoricals using TRAIN frequencies
-    freq_lookups: dict[str, pd.Series] = {}
-    for col in high_card_cat:
-        lookup = X_train_raw[col].astype(object).value_counts(normalize=True)
-        freq_lookups[col] = lookup
-        X_train_raw[col] = X_train_raw[col].map(lookup).fillna(0.0)
-        X_test_raw[col]  = X_test_raw[col].map(lookup).fillna(0.0)
-        if X_val_raw is not None:
-            X_val_raw[col] = X_val_raw[col].map(lookup).fillna(0.0)
-        numeric_cols.append(col)
-
-    # step 8: build the ColumnTransformer
+    # step 7 + 8: build ONE ColumnTransformer that owns every learned mapping.
+    #
+    # Frequency encoding used to happen here as a loose loop, with the lookups
+    # kept in a local dict that was never persisted. The saved artifact was
+    # therefore unable to transform new raw data. FrequencyEncoder now lives
+    # inside the pipeline, so fitting it stores the lookups and pickling the
+    # preprocessor carries them along.
     numeric_pipe = Pipeline([
-        ("impute", SimpleImputer(strategy="median")),
+        ("finite", InfinityToNaN()),
+        ("impute", SimpleImputer(strategy="median",
+                                 add_indicator=add_missing_indicators)),
         ("scale",  StandardScaler()),
     ])
     cat_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="most_frequent")),
         ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ])
+    freq_pipe = Pipeline([
+        ("freq",  FrequencyEncoder()),
+        ("scale", StandardScaler()),
+    ])
     transformers = []
     if numeric_cols:
         transformers.append(("num", numeric_pipe, numeric_cols))
     if low_card_cat:
         transformers.append(("cat", cat_pipe, low_card_cat))
+    if high_card_cat:
+        transformers.append(("freq", freq_pipe, high_card_cat))
     preprocessor = ColumnTransformer(transformers, remainder="drop")
 
     X_train = preprocessor.fit_transform(X_train_raw)
@@ -375,11 +581,15 @@ def preprocess(
                 y_val = np.log1p(y_val)
             target_transform = "log1p"
 
-    # step 10: build feature-name list
-    feature_names: list[str] = list(numeric_cols)
-    if low_card_cat:
-        ohe = preprocessor.named_transformers_["cat"].named_steps["encode"]
-        feature_names.extend(ohe.get_feature_names_out(low_card_cat).tolist())
+    # step 10: feature names, taken FROM THE FITTED TRANSFORMER.
+    # Rebuilding this list by hand meant it could silently drift out of sync
+    # with the actual column order, mislabelling every feature-importance chart.
+    # Asking the fitted object is the only way to stay correct when the
+    # transformer grows extra outputs (e.g. missing-value indicators).
+    feature_names = _feature_names_from(preprocessor, numeric_cols,
+                                        low_card_cat, high_card_cat)
+    if len(feature_names) != X_train.shape[1]:
+        feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
 
     summary = {
         "n_train": int(X_train.shape[0]),
@@ -394,9 +604,13 @@ def preprocess(
         "id_like_columns_dropped": dropped_id_cols,
         "split_strategy_used": split_used,
         "target_transform": target_transform,
+        "target_transform_requested": bool(log_transform_target),
         "test_size": test_size,
         "random_state": random_state,
         "group_column": group_column if group_column and groups_train is not None else None,
+        "duplicate_rows_dropped": n_duplicates_dropped,
+        "infinite_values_sanitized": n_inf,
+        "missing_indicators_added": bool(add_missing_indicators),
     }
 
     return PreprocessingResult(
