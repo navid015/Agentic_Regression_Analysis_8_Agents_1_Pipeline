@@ -25,13 +25,19 @@ STATE: dict[str, Any] = {
 }
 
 
+_DEFAULT_STATE: dict[str, Any] = dict(STATE)
+
+
 def reset_state() -> None:
-    for k in STATE:
-        STATE[k] = None
-    STATE.update({"test_size": 0.2, "random_state": 42, "cv_folds": 5,
-                  "cv_strategy": "kfold", "split_strategy": "random",
-                  "log_transform_target": False, "auto_datetime_features": True,
-                  "drop_low_variance": True, "tune_hyperparameters": False})
+    """Restore STATE to its declared defaults.
+
+    Previously this blanked every key to None and then re-applied only some of
+    them by hand, so any default not repeated in that literal was silently lost
+    and the two lists could drift apart. Snapshotting the declared defaults once
+    keeps them in exactly one place.
+    """
+    STATE.clear()
+    STATE.update(_DEFAULT_STATE)
 
 
 @tool("Profile dataset")
@@ -43,8 +49,12 @@ def profile_dataset_tool(_: str = "") -> str:
     target = STATE["target"]
     if df is None or target is None:
         return "ERROR: dataset and target must be loaded before profiling."
-    p = profile_dataframe(df, target)
-    STATE["profile"] = p
+    # Read-through cache. The orchestrator already profiled the data before
+    # kicking off the crew; recomputing here doubled the work on every run.
+    p = STATE.get("profile")
+    if p is None:
+        p = profile_dataframe(df, target)
+        STATE["profile"] = p
 
     lines = [
         f"Shape: {p['n_rows']} rows × {p['n_cols']} cols",
@@ -93,20 +103,24 @@ def preprocess_dataset_tool(_: str = "") -> str:
     """
     if STATE["df_train"] is None or STATE["target"] is None:
         return "ERROR: dataset and target must be loaded first."
-    try:
-        result = preprocess(
-            STATE["df_train"], STATE["target"],
-            df_val=STATE["df_val"], df_test=STATE["df_test"],
-            test_size=STATE["test_size"], random_state=STATE["random_state"],
-            split_strategy=STATE["split_strategy"], time_column=STATE["time_column"],
-            group_column=STATE["group_column"],
-            log_transform_target=STATE["log_transform_target"],
-            auto_datetime_features=STATE["auto_datetime_features"],
-            drop_low_variance=STATE["drop_low_variance"],
-        )
-    except ValueError as e:
-        return f"ERROR: {e}"
-    STATE["preprocessing"] = result
+    # Read-through cache: the orchestrator already preprocessed before kicking
+    # off the crew. Recomputing here ran the whole pipeline twice per request.
+    result = STATE.get("preprocessing")
+    if result is None:
+        try:
+            result = preprocess(
+                STATE["df_train"], STATE["target"],
+                df_val=STATE["df_val"], df_test=STATE["df_test"],
+                test_size=STATE["test_size"], random_state=STATE["random_state"],
+                split_strategy=STATE["split_strategy"], time_column=STATE["time_column"],
+                group_column=STATE["group_column"],
+                log_transform_target=STATE["log_transform_target"],
+                auto_datetime_features=STATE["auto_datetime_features"],
+                drop_low_variance=STATE["drop_low_variance"],
+            )
+        except ValueError as e:
+            return f"ERROR: {e}"
+        STATE["preprocessing"] = result
     s = result.summary
     lines = [
         f"Train rows: {s['n_train']}, Test rows: {s['n_test']}, "
@@ -123,6 +137,16 @@ def preprocess_dataset_tool(_: str = "") -> str:
         lines.append(f"Datetime features extracted from: {s['datetime_cols_extracted']}")
     if s.get("low_variance_dropped"):
         lines.append(f"Dropped low-variance columns: {s['low_variance_dropped']}")
+    if s.get("id_like_columns_dropped"):
+        lines.append(f"Dropped ID/row-index columns: {s['id_like_columns_dropped']}")
+    if s.get("duplicate_rows_dropped"):
+        lines.append(f"Dropped exact duplicate rows: {s['duplicate_rows_dropped']}")
+    if s.get("infinite_values_sanitized"):
+        lines.append("Infinite values converted to missing: "
+                     f"{s['infinite_values_sanitized']}")
+    if s.get("target_transform_requested") and s.get("target_transform") == "none":
+        lines.append("NOTE: log-transform was requested but skipped "
+                     "(target contains negative values).")
     return "\n".join(lines)
 
 
@@ -133,20 +157,26 @@ def train_models_tool(_: str = "") -> str:
     if pre is None:
         return "ERROR: must run preprocessing before training."
 
-    zoo = get_default_model_zoo(random_state=STATE["random_state"])
-    if STATE.get("selected_models"):
-        zoo = {k: v for k, v in zoo.items() if k in STATE["selected_models"]}
+    # Read-through cache. Retraining every model here doubled the single most
+    # expensive operation in the pipeline (and tripled it with tuning on).
+    results = STATE.get("results")
+    if results is None:
+        zoo = get_default_model_zoo(random_state=STATE["random_state"])
+        if STATE.get("selected_models"):
+            zoo = {k: v for k, v in zoo.items() if k in STATE["selected_models"]}
 
-    results = train_and_evaluate(
-        pre.X_train, pre.X_test, pre.y_train, pre.y_test,
-        models=zoo,
-        cv_folds=STATE["cv_folds"],
-        cv_strategy=STATE["cv_strategy"],
-        groups_train=pre.groups_train,
-        target_transform=pre.target_transform,
-        tune_hyperparameters=STATE["tune_hyperparameters"],
-    )
-    STATE["results"] = results
+        results = train_and_evaluate(
+            pre.X_train, pre.X_test, pre.y_train, pre.y_test,
+            models=zoo,
+            cv_folds=STATE["cv_folds"],
+            cv_strategy=STATE["cv_strategy"],
+            groups_train=pre.groups_train,
+            target_transform=pre.target_transform,
+            tune_hyperparameters=STATE["tune_hyperparameters"],
+            X_val=pre.X_val, y_val=pre.y_val,
+            random_state=STATE["random_state"],
+        )
+        STATE["results"] = results
     ranked = rank_models(results)
     lines = ["Trained models (best to worst by RMSE):"]
     for name, rmse, r2 in ranked:
@@ -268,5 +298,17 @@ def quality_review_tool(_: str = "") -> str:
                 )
             if te < 0:
                 issues.append(f"{name}: negative test R² → worse than predicting the mean.")
+            # Fold-to-fold instability is a better overfitting signal than any
+            # fixed train/test gap: a model can sit inside the gap threshold and
+            # still be a coin flip. CV_R2_std was already collected and shown in
+            # the UI, but never fed the verdict until now.
+            cv_mean = r.metrics.get("CV_R2_mean")
+            cv_std = r.metrics.get("CV_R2_std")
+            if cv_mean is not None and cv_std is not None and cv_std > 0.15:
+                issues.append(
+                    f"{name}: cross-validated R² is unstable "
+                    f"({cv_mean:.3f} ± {cv_std:.3f} across folds) — the score "
+                    "depends heavily on which rows the model saw."
+                )
     return "Quality review: no major red flags." if not issues \
         else "Quality review findings:\n  - " + "\n  - ".join(issues)
