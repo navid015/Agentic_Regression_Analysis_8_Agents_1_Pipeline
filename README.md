@@ -33,9 +33,11 @@ Upload one CSV (or three: train / val / test) → 8 specialized agents plan, pro
 | 💻 Code Generator | Describes the reproducible artifacts |
 | 📝 Insight Reporter | Plain-language executive summary |
 
-## 🤖 Up to 11 regression models
+## 🤖 Up to 11 regression models + a baseline
 
 LinearRegression · Ridge · Lasso · ElasticNet · DecisionTree · RandomForest · GradientBoosting · KNN · SVR · *(optional)* XGBoost · LightGBM
+
+A **mean-prediction baseline** is always trained alongside them. It is never selected as the winner — it exists so every other score is interpretable (“is this model actually better than doing nothing?”) and so a negative R² is obvious rather than mysterious.
 
 ## 📊 Charts
 
@@ -46,9 +48,26 @@ Predicted vs Actual · Residuals vs Predicted · Residual Distribution · Q-Q Pl
 RMSE / MAE / R² bars · grouped error metrics · CV R² box · training time · predicted-vs-actual overlay
 
 ## 📁 Generated artifacts
+
+All three are downloadable from the **Code** tab:
+
 - `regression_pipeline.py` — single-file reproducible script
 - `regression_pipeline.ipynb` — same pipeline as a Jupyter notebook
-- `best_model.joblib` — preprocessor + best model, ready to load
+- `best_model.joblib` — fitted preprocessor + winning model in one object
+
+The bundle is genuinely self-contained: every learned mapping (imputation,
+scaling, one-hot **and** frequency encoding) lives inside the preprocessor, so
+it transforms raw data without any extra state.
+
+```python
+import joblib, numpy as np, pandas as pd
+
+bundle = joblib.load("best_model.joblib")
+X = bundle["preprocessor"].transform(pd.read_csv("new_rows.csv"))
+pred = bundle["model"].predict(X)
+if bundle["target_transform"] == "log1p":
+    pred = np.expm1(pred)
+```
 
 ---
 
@@ -80,6 +99,32 @@ Open `http://localhost:7860`.
 
 ---
 
+## ✅ Correctness guarantees
+
+The pipeline is written to avoid the leakage and evaluation mistakes that make
+AutoML output look better than it is:
+
+| Guard | What it prevents |
+| --- | --- |
+| Whole-token identifier detection | Deleting real features (`fixed_acidity`, `humidity`, `width`) while still catching `Unnamed: 0` and `customer_id` |
+| Row-index / ID auto-drop | A leftover counter on a target-sorted CSV scoring R² ≈ 1.0 on nothing |
+| Group-aware **split** and CV | The same patient / store appearing on both sides of the split |
+| Time-aware split (refuses to run without a time column) | Training on the future to predict the past |
+| Exact-duplicate removal before splitting | Identical rows straddling the split, leaking the answer |
+| `fit` on train, `transform` elsewhere | Test statistics informing imputation, scaling or encoding |
+| Validation-based model selection | The test set doubling as a selection set |
+| Original-unit CV scorers under `log1p` | Comparing a log-scale CV R² against an original-scale test R² |
+| Two-signal leakage audit | Crying wolf on datasets that are simply very predictable |
+
+Run the suite with:
+
+```bash
+pip install pytest
+pytest -q
+```
+
+---
+
 ## 🧩 How it works
 
 The system separates **what to do** (agents) from **how to do it** (deterministic utilities):
@@ -106,6 +151,8 @@ regression_crew/
 │   ├── tasks.py                 # Task descriptions with concrete expected outputs
 │   ├── tools.py                 # CrewAI tools wrapping the utilities
 │   └── orchestrator.py          # Main runner
+├── tests/
+│   └── test_pipeline.py      # leakage / metric / selection regression tests
 └── utils/
     ├── __init__.py
     ├── preprocessing.py         # Multi-file, datetime, log-transform, time/group splits
