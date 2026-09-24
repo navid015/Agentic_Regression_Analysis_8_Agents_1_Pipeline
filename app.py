@@ -26,7 +26,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from crew.orchestrator import PipelineOutput, run_full_pipeline
-from utils.modeling import available_model_names
+from utils.io import read_table
+from utils.modeling import BASELINE_MODEL_NAME, available_model_names
 from utils.visualization import (
     comparison_charts,
     per_model_charts,
@@ -308,9 +309,8 @@ def _empty_state() -> dict:
 # Helpers — file I/O, target column detection
 # ---------------------------------------------------------------------------
 def _load_csv(filepath: str | None) -> pd.DataFrame | None:
-    if filepath is None or not os.path.exists(filepath):
-        return None
-    return pd.read_csv(filepath)
+    """Delimiter- and encoding-aware (';'-separated and Latin-1 files load correctly)."""
+    return read_table(filepath)
 
 
 def _numeric_columns(df: pd.DataFrame | None) -> list[str]:
@@ -390,6 +390,10 @@ import threading
 import time as _time_mod
 
 
+def _split_names(text) -> list[str]:
+    return [t.strip() for t in str(text or "").split(",") if t.strip()]
+
+
 def _render_timeline(events: list[dict]) -> str:
     """Render the timeline events as HTML."""
     if not events:
@@ -436,7 +440,10 @@ def on_run(
     auto_datetime, drop_lowvar, drop_id_cols, drop_dupes, missing_flags,
     tuning_choice, selection_choice, auto_fix, ensemble, one_se, interactions, nested,
     use_agents,
-    state,
+    hc_encoding="Target encoding (recommended)", cat_cols_text="", drop_cols_text="",
+    refit_choice="Auto (train + validation if supplied)", adaptive_intervals=True,
+    auto_refine=False, llm_advisor=False,
+    state=None,
 ):
     """Generator: streams timeline updates while the pipeline runs on a thread."""
     state = state or _empty_state()
@@ -514,8 +521,10 @@ def on_run(
                 target=target,
                 selected_models=selected_models,
                 test_size=test_size, random_state=int(random_state), cv_folds=int(n_folds),
-                cv_strategy=("group" if group_col not in (None, "(none)") else
-                             "time"  if split_strategy == "Time-aware" else "kfold"),
+                # time first: a time-aware split must be validated forward in time,
+                # even when a group column is also chosen
+                cv_strategy=("time" if split_strategy == "Time-aware" else
+                             "group" if group_col not in (None, "(none)") else "kfold"),
                 split_strategy=("time" if split_strategy == "Time-aware" else "random"),
                 time_column=None if time_col in (None, "(none)") else time_col,
                 group_column=None if group_col in (None, "(none)") else group_col,
@@ -531,6 +540,14 @@ def on_run(
                 auto_remediate=auto_fix, build_ensemble=ensemble, one_se_rule=one_se,
                 add_interactions=interactions, nested_cv=nested,
                 use_agents=use_agents,
+                high_cardinality_encoding=("frequency" if str(hc_encoding).startswith("Frequency")
+                                           else "target"),
+                categorical_columns=_split_names(cat_cols_text),
+                drop_columns=_split_names(drop_cols_text),
+                final_refit={"Training rows only": "train",
+                             "All labelled rows (train + val + test)": "all"}.get(refit_choice, "auto"),
+                adaptive_intervals=bool(adaptive_intervals),
+                auto_refine=bool(auto_refine), use_llm_advisor=bool(llm_advisor and auto_refine),
                 progress_callback=progress_cb,
                 csv_filename=state.get("train_filename") or "train.csv",
                 val_csv_filename=state.get("val_filename"),
@@ -603,7 +620,9 @@ def _metric_card(label: str, value: str, gold: bool = False) -> str:
 
 _FIT_LABEL = {"good": "Good fit", "benign": "Good (harmless gap)",
               "overfit": "Overfitting", "underfit": "Underfitting",
-              "unstable": "Unstable", "unknown": "Unknown"}
+              "unstable": "Unstable", "unknown": "Unknown",
+              "low_signal": "Low signal (nothing to learn)", "cv_failed": "CV failed (excluded)",
+              "reference": "Reference (baseline)"}
 
 
 def _orig_units(pre, y):
@@ -626,7 +645,7 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         {_metric_card("Rows", f"{out.profile['n_rows']:,}")}
         {_metric_card("Features", f"{out.preprocessing.summary['n_features_after']}")}
         {_metric_card("Models trained", f"{len(out.results)}")}
-        {_metric_card("Best R²", f"{bm['R2']:.4f}", gold=True)}
+        {_metric_card("Winner test R²", f"{bm['R2']:.4f}", gold=True)}
     </div>
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;">
         {_metric_card("Best model", best, gold=True)}
@@ -651,16 +670,19 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
             "1. Profile dataset (types, missingness, target stats, datetime/leakage candidates)\n"
             "2. Auto-extract datetime features and drop low-variance columns\n"
             "3. Split into train/test (random or time-aware) — or use user-supplied splits\n"
-            "4. Impute, encode, scale (optionally add interaction features)\n"
-            "5. Log-transform the target if it is skewed (auto)\n"
+            "4. Impute, encode (target encoding for high-cardinality), scale - fitted inside every CV fold\n"
+            "5. Log-transform the target if cross-validation says it helps (auto)\n"
             f"6. Train {len(out.results)} regressors (tuning: {out.options_used['tuning']}) "
             f"with {out.options_used['cv_scheme']}\n"
-            "7. Diagnose every model: good / overfit / underfit / unstable (CV only, test untouched)\n"
+            "7. Diagnose every model against a flexible reference model: good / overfit / underfit / "
+            "low-signal / unstable (CV only, test untouched)\n"
             "8. Automatically retrain over- or underfitting models with better settings\n"
-            "9. Build an ensemble of the top three; pick the winner by validation or CV error "
-            "(one-standard-error rule prefers simpler models)\n"
+            "9. Ensemble the best model of three different families; pick the winner on shared "
+            "folds with a paired one-standard-error rule, and report the baseline if no model is "
+            "reliably better than predicting the mean\n"
             "10. Learning curve + prediction interval for the winner; charts; reproducible code"
         )
+    plan_md += _run_notes_md(out)
 
     # ---- Data & Preprocessing ----
     profile_rows = []
@@ -679,8 +701,8 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         f"- **Features after encoding:** {s['n_features_after']}\n"
         f"- **Numeric columns:** {len(s['numeric_cols'])}\n"
         f"- **One-hot encoded categoricals:** {len(s['low_cardinality_categorical'])}\n"
-        f"- **Frequency-encoded high-cardinality:** "
-        f"{len(s['high_cardinality_categorical_freq_encoded'])}\n"
+        f"- **High-cardinality ({s.get('high_cardinality_encoding', 'target')}-encoded):** "
+        f"{len(s.get('high_cardinality_categorical', s['high_cardinality_categorical_freq_encoded']))}\n"
         f"- **Split strategy:** {s['split_strategy_used']}\n"
         f"- **Target transform:** {s['target_transform']}\n"
     )
@@ -691,10 +713,25 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     if s.get("id_like_columns_dropped"):
         pre_md += (f"- **ID/row-index columns auto-dropped (would leak if kept):** "
                    f"{s['id_like_columns_dropped']}\n")
-    if s.get("target_transform_requested") == "auto":
-        pre_md += (f"- **Log transform (auto):** training-target skew = "
-                   f"{s.get('target_skew_train', 0):+.2f} → "
-                   f"{'applied' if s['target_transform'] == 'log1p' else 'not needed'}\n")
+    dec = out.target_transform_decision or {}
+    if dec.get("method") == "cv":
+        errs = dec.get("errors", {})
+        pre_md += (f"- **Log transform (auto, decided by cross-validation):** best CV error raw = "
+                   f"{errs.get('none', float('nan')):.4g}, log1p = {errs.get('log1p', float('nan')):.4g} → "
+                   f"{'applied' if s['target_transform'] == 'log1p' else 'raw scale kept'}\n")
+    elif dec.get("method") == "rule":
+        pre_md += (f"- **Log transform (auto):** not applied - {dec.get('reason', '')} "
+                   f"(skew {s.get('target_skew_train', 0):+.2f})\n")
+    elif s.get("target_transform_requested") == "auto":
+        pre_md += (f"- **Log transform (auto):** {s.get('target_transform_reason', '')} → "
+                   f"{'applied' if s['target_transform'] == 'log1p' else 'not applied'}\n")
+    for key, label in (("numeric_string_columns_parsed", "Formatted numbers parsed"),
+                       ("categorical_overrides", "Treated as categories"),
+                       ("user_dropped_columns", "Dropped at your request"),
+                       ("id_suspect_columns_kept", "Unique sorted integers KEPT (check they are real features)")):
+        if s.get(key):
+            pre_md += f"- **{label}:** {s[key]}\n"
+    pre_md += "- **Preprocessing is fitted inside every CV fold** (no held-out statistics leak in)\n"
     if s.get("interaction_features_added"):
         pre_md += "- **Interaction features:** pairwise products of numeric columns added\n"
 
@@ -758,10 +795,15 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     basis = getattr(out, "selection_basis", "cv")
     basis_note = {
         "validation": "selected on the **validation** file",
-        "cv": "selected by **cross-validation on the training rows**",
-        "test": "selected on the **test** set (cross-validation was unavailable), so its "
-                "test score is mildly optimistic",
+        "cv": "selected by **cross-validation on the training rows** (all models on the same folds)",
+        "test": "selected on the **test** set because no model could be cross-validated, so its "
+                "test score is optimistic",
     }.get(basis, basis)
+    honesty = ("The test set was not used for any decision, so its scores are an honest estimate."
+               if basis != "test" else "⚠️ The test set WAS used to choose the winner.")
+    if best == BASELINE_MODEL_NAME:
+        honesty = ("⚠️ **No reliable signal**: no model beat predicting the mean by a margin larger "
+                   "than fold-to-fold noise. " + honesty)
     extra = ""
     if out.skipped_models:
         extra += "\n\n**Skipped:** " + "; ".join(f"`{k}` — {v}" for k, v in out.skipped_models.items())
@@ -770,7 +812,7 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     counts = out.options_used.get("fit_status_counts", {})
     winners_md = (
         f"🏆 **Overall winner:** `{best}` — {basis_note}; rule: {out.selection_note}. "
-        f"The test set was not used for any decision, so its scores are an honest estimate.\n\n"
+        f"{honesty}\n\n"
         f"**Selection metric:** {out.selection_metric_reason}.  "
         f"**Fit check across models:** " + ", ".join(f"{_FIT_LABEL.get(k, k)}: {v}"
                                                        for k, v in counts.items()) + "\n\n"
@@ -794,9 +836,8 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     pm_charts = per_model_charts(
         default_model, y_test_orig,
         out.results[default_model].y_pred_test,
-        out.results[default_model].cv_scores.get("R2"),
-        _importances_for(out.results[default_model]),
-        out.preprocessing.feature_names,
+        _cv_r2_for(out.results[default_model]),
+        *_importances_for(out.results[default_model], out.preprocessing.feature_names),
         learning_curve=out.results[default_model].learning_curve,
     )
     pm_figs = [pm_charts.get(k) for k in _PM_CHART_ORDER]
@@ -804,12 +845,9 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     pm_metric_html = _per_model_metric_html(default_model, out.results[default_model])
 
     # ---- Generated code ----
-    tmp_dir = Path(tempfile.gettempdir()) / "regression_crew_outputs"
-    tmp_dir.mkdir(exist_ok=True)
-    py_path  = tmp_dir / "regression_pipeline.py"
-    nb_path  = tmp_dir / "regression_pipeline.ipynb"
-    py_path.write_text(out.generated_script)
-    nb_path.write_text(out.generated_notebook)
+    # files live in a directory created for THIS run (a shared temp path let
+    # concurrent users download each other's artifacts)
+    py_path, nb_path = out.script_path, out.notebook_path
 
     code_md = out.agent_outputs.get("code") or "*Agent commentary unavailable.*"
 
@@ -845,17 +883,41 @@ _PM_CHART_ORDER = ["Predicted vs Actual", "Residuals vs Predicted", "Residual Di
                    "Q-Q Plot", "CV R² Distribution", "Feature Importance", "Learning Curve"]
 
 
-def _importances_for(result):
-    """Prefer held-out permutation importance (winner) over built-in importance."""
-    if result.permutation_importances is not None:
-        return result.permutation_importances
-    return result.feature_importances
+def _importances_for(result, fallback_names):
+    """(values, names): held-out permutation importance per ORIGINAL column for the
+    winner; built-in importance per encoded feature for the others."""
+    if result.permutation_importances is not None and result.permutation_feature_names:
+        return result.permutation_importances, result.permutation_feature_names
+    return result.feature_importances, (result.importance_feature_names or fallback_names)
+
+
+def _cv_r2_for(result):
+    cv = result.cv_scores or {}
+    return cv.get("R2g") or cv.get("R2")
+
+
+def _run_notes_md(out) -> str:
+    parts = []
+    if out.warnings:
+        parts.append("**Setup adjustments:**\n" + "\n".join(f"- {w}" for w in out.warnings))
+    if out.refinement_log:
+        rows = [f"- round {e['round']} ({e['source']}): `{e['actions']}` → "
+                f"{'**kept**' if e['accepted'] else 'rejected'} — {e['reason']}" for e in out.refinement_log]
+        parts.append("**Refinement loop** (each change re-ran the pipeline; kept only if CV improved):\n"
+                     + "\n".join(rows))
+    if out.pending_confirmation:
+        rows = [f"- `{p['action']}` = `{p['value']}` — {p['reason']}" for p in out.pending_confirmation]
+        parts.append("**Needs your confirmation** (not applied automatically; add the column to "
+                     "*Drop these columns* and re-run if you agree):\n" + "\n".join(rows))
+    if out.final_model_note:
+        parts.append(f"**Saved model:** {out.final_model_note}.")
+    return ("\n\n---\n\n" + "\n\n".join(parts)) if parts else ""
 
 
 def _per_model_metric_html(name: str, result) -> str:
     m = result.metrics
     status = result.fit_status
-    css = "scope-good" if status in ("good", "benign") else "scope-warn"
+    css = "scope-good" if status in ("good", "benign", "reference") else "scope-warn"
     reasons = "; ".join(_html_mod.escape(x) for x in result.fit_reasons)
     diag = (f'<div class="{css}" style="margin-top:8px;"><b>Fit diagnosis: '
             f'{_FIT_LABEL.get(status, status)}</b> — {reasons}</div>')
@@ -877,7 +939,9 @@ def _per_model_metric_html(name: str, result) -> str:
     if result.best_params:
         extras.append("settings: " + ", ".join(f"{k}={v}" for k, v in result.best_params.items()))
     if result.ensemble_members:
-        extras.append("members: " + ", ".join(result.ensemble_members))
+        extras.append("members (one per model family): " + ", ".join(result.ensemble_members))
+    if result.smearing_factor:
+        extras.append(f"log-target bias correction applied (smearing factor {result.smearing_factor:.4f})")
     pi = result.prediction_interval or {}
     if "test_coverage" in pi:
         extras.append(f"{pi['coverage_target']:.0%} interval: covers {pi['test_coverage']:.0%} of "
@@ -902,8 +966,8 @@ def on_model_dropdown_change(model_name: str, state: dict):
     res = out.results[model_name]
     charts = per_model_charts(
         model_name, _orig_units(out.preprocessing, out.preprocessing.y_test),
-        res.y_pred_test, res.cv_scores.get("R2"), _importances_for(res),
-        out.preprocessing.feature_names, learning_curve=res.learning_curve,
+        res.y_pred_test, _cv_r2_for(res), *_importances_for(res, out.preprocessing.feature_names),
+        learning_curve=res.learning_curve,
     )
     figs = [charts.get(k) for k in _PM_CHART_ORDER]
     return (gr.update(value=_per_model_metric_html(model_name, res)),
@@ -948,7 +1012,7 @@ def build_ui():
             '<h1>📈 Agentic Regression Analysis — 8 Agents, 1 Pipeline</h1>'
             '<p>Agentic end-to-end regression analysis — upload a CSV (or train/val/test), '
             'pick a target, explore models &amp; charts, and download reproducible code. '
-            'Eight CrewAI agents profile your data, train and rank up to 11 models, '
+            'Eight CrewAI agents profile your data, train and rank up to 15 models plus a diverse ensemble, '
             'audit for leakage and overfitting, and write a plain-language report — '
             'so you get both the numbers and the narrative.</p>'
             '</div>'
@@ -1055,9 +1119,29 @@ def build_ui():
                             drop_lowvar_cb    = gr.Checkbox(True,  label="Drop low-variance columns")
                             drop_id_cb        = gr.Checkbox(True,  label="Auto-drop ID/row-index columns (recommended — prevents subtle leakage when data is sorted)")
                             drop_dupes_cb     = gr.Checkbox(True,  label="Drop exact duplicate rows before splitting (recommended — duplicates across the split leak the answer)")
-                            missing_flags_cb  = gr.Checkbox(False, label="Add missing-value indicator features (missingness is often informative)")
+                            missing_flags_cb  = gr.Checkbox(True, label="Add missing-value indicator features (missingness is often informative)")
+                            hc_encoding_radio = gr.Radio(["Target encoding (recommended)", "Frequency encoding"],
+                                                         value="Target encoding (recommended)",
+                                                         label="High-cardinality categoricals (> 20 levels)")
+                            cat_cols_tb       = gr.Textbox(label="Treat these columns as categorical (comma-separated)",
+                                                           placeholder="e.g. zipcode, product_code")
+                            drop_cols_tb      = gr.Textbox(label="Drop these columns (e.g. suspected target leakage)",
+                                                           placeholder="e.g. price_per_sqft")
+                            refit_radio       = gr.Radio(["Auto (train + validation if supplied)", "Training rows only",
+                                                          "All labelled rows (train + val + test)"],
+                                                         value="Auto (train + validation if supplied)",
+                                                         label="Rows used to fit the SAVED model")
+                            adaptive_cb       = gr.Checkbox(True, label="Adaptive prediction intervals (narrow for easy rows, wide for hard ones)")
 
-                        gr.Markdown("### 5. CrewAI agent narration")
+                        gr.Markdown("### 5. Agentic refinement")
+                        refine_cb = gr.Checkbox(False, label="Auto-refine: the advisor proposes improvements, "
+                                                             "re-runs the pipeline and keeps a change only if "
+                                                             "cross-validated error improves (slower)")
+                        llm_advisor_cb = gr.Checkbox(False, label="Also ask the LLM for proposals "
+                                                                  "(whitelisted actions only)",
+                                                     interactive=has_llm)
+
+                        gr.Markdown("### 6. CrewAI agent narration")
                         if has_llm:
                             gr.HTML(f'<div class="scope-good">✅ <b>{llm_provider}</b> '
                                     f'API key detected. Agents available.</div>')
@@ -1232,7 +1316,9 @@ def build_ui():
             models_cb, split_strategy, log_target_cb,
             auto_dt_cb, drop_lowvar_cb, drop_id_cb, drop_dupes_cb, missing_flags_cb,
             tuning_radio, selection_radio, auto_fix_cb, ensemble_cb, one_se_cb,
-            interact_cb, nested_cb, use_agents_cb, state,
+            interact_cb, nested_cb, use_agents_cb,
+            hc_encoding_radio, cat_cols_tb, drop_cols_tb, refit_radio, adaptive_cb,
+            refine_cb, llm_advisor_cb, state,
         ]
 
         # Keep the placeholder count in lockstep with the real component list.
@@ -1279,7 +1365,7 @@ _SCOPE_HTML = """
     <li><b style="color: #ffffff;">Independent rows</b> — each row is its own observation</li>
     <li><b style="color: #ffffff;">Reasonable size</b> — a few hundred to ~100k rows, up to a few hundred features</li>
     <li><b style="color: #ffffff;">Some missing values</b> — gets median (numeric) or mode (categorical) imputation</li>
-    <li><b style="color: #ffffff;">Mixed feature types</b> including high-cardinality categoricals (frequency-encoded)</li>
+    <li><b style="color: #ffffff;">Mixed feature types</b> including high-cardinality categoricals (cross-fitted target encoding) and numbers stored as text ("$1,250", "12%")</li>
     <li><b style="color: #ffffff;">Datetime columns</b> — automatically decomposed into year/month/day/weekday/hour</li>
     <li><b style="color: #ffffff;">User-supplied train/val/test splits</b> — no random split applied when you upload three files</li>
   </ul>
