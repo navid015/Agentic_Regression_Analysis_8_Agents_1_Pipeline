@@ -113,8 +113,32 @@ def cv_score_box(model_name, cv_r2) -> go.Figure | None:
     return _apply_defaults(fig, height=360)
 
 
+def learning_curve_chart(model_name, lc) -> go.Figure | None:
+    """Train vs held-out R² as training data grows — the clearest picture of
+    over- vs underfitting. Shaded bands are ±1 standard deviation across folds."""
+    if not lc:
+        return None
+    x = np.asarray(lc["train_sizes"]); fig = go.Figure()
+    for key, label, color in (("train", "Training score", "#3b82f6"),
+                              ("val", "Held-out (CV) score", "#10b981")):
+        m = np.asarray(lc[f"{key}_mean"]); sd = np.asarray(lc[f"{key}_std"])
+        fig.add_trace(go.Scatter(x=np.concatenate([x, x[::-1]]),
+                                 y=np.concatenate([m + sd, (m - sd)[::-1]]),
+                                 fill="toself", fillcolor=color, opacity=0.15,
+                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=m, mode="lines+markers", name=label,
+                                 line=dict(color=color, width=2.5)))
+    fig.update_layout(title=f"{model_name} — Learning curve", xaxis_title="Training rows used",
+                      yaxis_title="R² (higher is better)")
+    fig.add_annotation(text=lc.get("reading", ""), xref="paper", yref="paper", x=0, y=-0.28,
+                       showarrow=False, align="left", font=dict(size=11, color="#374151"))
+    fig = _apply_defaults(fig, height=440)
+    fig.update_layout(margin=dict(l=60, r=80, t=55, b=110))
+    return fig
+
+
 def per_model_charts(model_name, y_test, y_pred_test, cv_r2,
-                     importances, feature_names) -> dict[str, go.Figure]:
+                     importances, feature_names, learning_curve=None) -> dict[str, go.Figure]:
     charts: dict[str, go.Figure] = {
         "Predicted vs Actual":     predicted_vs_actual(y_test, y_pred_test,
                                                         f"{model_name} — Predicted vs Actual"),
@@ -131,6 +155,9 @@ def per_model_charts(model_name, y_test, y_pred_test, cv_r2,
                                       f"{model_name} — Feature Importance")
     if fi_fig is not None:
         charts["Feature Importance"] = fi_fig
+    lc_fig = learning_curve_chart(model_name, learning_curve)
+    if lc_fig is not None:
+        charts["Learning Curve"] = lc_fig
     return charts
 
 
