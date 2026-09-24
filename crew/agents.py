@@ -1,105 +1,65 @@
 """
-CrewAI agents — eight specialists.
+CrewAI agents - eight specialists, each grounded in tools bound to ONE run.
+
+v3: the chart and code agents used to have no tools at all (they described
+charts and files they could not see); every agent now reads real numbers.
+The "planner" reviews the plan that was actually executed, including the
+advisor's refinement loop, instead of writing a plan nobody executes.
 """
 
 from __future__ import annotations
 
-from crewai import Agent
 
-from .tools import (
-    best_model_tool,
-    preprocess_dataset_tool,
-    profile_dataset_tool,
-    quality_review_tool,
-    train_models_tool,
-)
+def build_agents(llm, tools: dict):
+    from crewai import Agent
 
-
-def build_agents(llm) -> dict[str, Agent]:
-    planner = Agent(
-        role="ML Project Planner",
-        goal="Lay out a concrete, sequenced plan for the regression analysis.",
-        backstory="A senior ML engineer who thinks in steps and writes plans others can execute.",
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    eda_agent = Agent(
-        role="Exploratory Data Analyst",
-        goal=("Profile the dataset and produce SPECIFIC observations citing actual "
-              "column names, missing percentages, target stats, and skew values."),
-        backstory=(
-            "A data scientist who never trusts a CSV until inspecting every column. "
-            "You write commentary that names columns, quotes percentages, and flags "
-            "concrete risks — never vague phrasing like 'some columns may have issues'."
-        ),
-        tools=[profile_dataset_tool],
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    preprocessor = Agent(
-        role="Data Preprocessing Engineer",
-        goal="Transform the raw data into clean numeric arrays and explain the choices.",
-        backstory=(
-            "You build robust scikit-learn pipelines. Median imputation for numerics, "
-            "mode + one-hot for low-card categoricals, frequency encoding for high-card, "
-            "datetime decomposition where appropriate, standardization at the end."
-        ),
-        tools=[preprocess_dataset_tool],
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    modeler = Agent(
-        role="ML Modeler & Evaluator",
-        goal=("Train multiple regressors, report which ones over- or underfit and how they "
-              "were fixed, and explain why the selected winner was chosen."),
-        backstory=(
-            "You believe in trying many models and letting honest metrics decide: "
-            "cross-validation on training rows (or a validation file) picks the winner, "
-            "the test set is only a final check. You report the top three with concrete "
-            "numbers, and always say whether each is well-fitted, overfitting or underfitting."
-        ),
-        tools=[train_models_tool, best_model_tool],
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    chart_agent = Agent(
-        role="Visualization Specialist",
-        goal="Confirm the chart inventory and explain what each diagnostic plot reveals.",
-        backstory=(
-            "Visualization-first practitioner who believes a residual plot tells more "
-            "than any single number."
-        ),
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    code_agent = Agent(
-        role="Code Generator",
-        goal="Describe the standalone Python script and Jupyter notebook produced.",
-        backstory="You write code other engineers want to read.",
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    insight_reporter = Agent(
-        role="Insight Reporter",
-        goal=("Translate the metrics into a plain-language executive summary that a "
-              "non-technical reader can act on."),
-        backstory="You write the executive summary at the top of every ML report.",
-        tools=[best_model_tool],
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-
-    quality_reviewer = Agent(
-        role="Quality Reviewer",
-        goal=("Audit for target leakage, overfitting, underfitting, unstable scores, "
-              "outliers, degenerate targets and skew. Give a clear go / caution / no-go "
-              "recommendation."),
-        backstory="The last line of defense before a model goes live.",
-        tools=[quality_review_tool],
-        llm=llm, verbose=False, allow_delegation=False,
-    )
+    def agent(role, goal, backstory, tool_keys):
+        return Agent(role=role, goal=goal, backstory=backstory, llm=llm, verbose=False,
+                     allow_delegation=False, tools=[tools[k] for k in tool_keys])
 
     return {
-        "planner": planner, "eda": eda_agent, "preprocessor": preprocessor,
-        "modeler": modeler, "chart": chart_agent, "code": code_agent,
-        "insight": insight_reporter, "quality": quality_reviewer,
+        "planner": agent(
+            "ML Project Planner",
+            "Explain the plan that was executed - including automatic decisions and the refinement "
+            "loop - and recommend concrete next steps.",
+            "A senior ML engineer who distinguishes what WAS done from what SHOULD be done next.",
+            ["profile", "preprocess", "refinement"]),
+        "eda": agent(
+            "Exploratory Data Analyst",
+            "Produce SPECIFIC observations citing column names, missing percentages, target "
+            "statistics and structural findings.",
+            "Never trusts a CSV until every column is inspected; never writes vague phrases.",
+            ["profile"]),
+        "preprocessor": agent(
+            "Data Preprocessing Engineer",
+            "Explain every preprocessing choice and why it was made for THIS dataset.",
+            "Builds leak-free scikit-learn pipelines fitted inside each CV fold.",
+            ["preprocess"]),
+        "modeler": agent(
+            "ML Modeler & Evaluator",
+            "Compare models on cross-validated error, explain fit diagnoses and why the winner won.",
+            "Lets honest metrics decide: shared folds and paired comparisons pick the winner; the test "
+            "set is only a final check. Says plainly when no model beats the baseline.",
+            ["train", "best"]),
+        "chart": agent(
+            "Visualization Specialist",
+            "Explain what the diagnostic charts show, using the numeric residual diagnostics.",
+            "Believes a residual plot tells more than any single number - and quantifies it.",
+            ["diagnostics", "best"]),
+        "code": agent(
+            "Code Generator",
+            "Describe the generated script, notebook and model bundle and how to use them.",
+            "Writes code other engineers want to read.",
+            ["artifacts"]),
+        "insight": agent(
+            "Insight Reporter",
+            "Write a plain-language executive summary a non-technical reader can act on.",
+            "Writes the summary at the top of every ML report.",
+            ["best", "quality"]),
+        "quality": agent(
+            "Quality Reviewer",
+            "Audit for leakage, split overlap, over/underfitting, low signal and interval coverage, and "
+            "give a clear go / caution / no-go verdict.",
+            "The last line of defense before a model goes live.",
+            ["quality", "refinement"]),
     }
