@@ -25,12 +25,15 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, StandardScaler
 
 HIGH_CARDINALITY_THRESHOLD = 20
 LOW_VARIANCE_NUNIQUE = 1  # column has only 1 unique value -> drop
 NEAR_CONSTANT_FREQ = 0.999  # single value covers >=99.9% of rows -> effectively constant
 LOG_TRANSFORM_SKEW_THRESHOLD = 1.5  # |skew| above this triggers auto log-suggestion
+# Pairwise interaction features are only added when there are at most this many
+# numeric columns: n columns produce n*(n-1)/2 extra features.
+MAX_INTERACTION_BASE_COLUMNS = 15
 
 # Whole-token names that mean "this is a row identifier".
 #
@@ -138,6 +141,8 @@ class PreprocessingResult:
     # optional pieces
     X_val: np.ndarray | None = None
     y_val: np.ndarray | None = None
+    # RawFeatureBuilder + ColumnTransformer: accepts raw rows (used for the saved bundle)
+    raw_preprocessor: Any = None
     target_transform: Literal["none", "log1p"] = "none"
     groups_train: np.ndarray | None = None  # for group-aware CV
 
@@ -249,6 +254,74 @@ def _extract_datetime_features(df: pd.DataFrame, cols: list[str],
     return out, used_hour_cols
 
 
+def _time_split_features(frames: list[pd.DataFrame], col: str, parsed_train: pd.Series
+                         ) -> tuple[list[pd.DataFrame], list[str], dict]:
+    """Features from the column used for a time-aware split.
+
+    * `<col>_elapsed_days`: days since the start of training. Carries the trend,
+      so models (linear ones especially) can extrapolate into the future.
+    * Calendar parts only when the TRAINING period covers at least two full
+      cycles of them. With less than a year of data, "month" simply rises with
+      time; a model learns it as a trend and then collapses when January comes
+      round again in the test period. The span rule prevents that.
+    * No `_year`: elapsed time already captures it, and future years are never
+      seen in training.
+    """
+    t0, t1 = parsed_train.min(), parsed_train.max()
+    span_days = (t1 - t0).total_seconds() / 86400.0 if pd.notna(t0) and pd.notna(t1) else 0.0
+    has_time_of_day = bool(parsed_train.dt.hour.fillna(0).sum() > 0)
+    parts = {
+        "weekday": span_days >= 14,
+        "day":     span_days >= 60,
+        "month":   span_days >= 730,
+        "hour":    has_time_of_day and span_days >= 2,
+    }
+    out = []
+    for fr in frames:
+        fr = fr.copy()
+        parsed = pd.to_datetime(fr[col], errors="coerce")
+        fr[f"{col}_elapsed_days"] = (parsed - t0).dt.total_seconds() / 86400.0
+        for part, keep in parts.items():
+            if keep:
+                fr[f"{col}_{part}"] = getattr(parsed.dt, part)
+        out.append(fr.drop(columns=[col]))
+    names = [f"{col}_elapsed_days"] + [f"{col}_{p}" for p, k in parts.items() if k]
+    return out, names, {"column": col, "t0": t0, "parts": [p for p, k in parts.items() if k]}
+
+
+class RawFeatureBuilder(BaseEstimator, TransformerMixin):
+    """Re-creates, on RAW rows, the features that preprocess() derives before the
+    ColumnTransformer: date-part columns and the time-split features.
+
+    Placed in front of the ColumnTransformer in the saved bundle so that
+    best_model.joblib really does accept raw CSV rows (previously it failed
+    with "columns are missing" whenever the data had date columns).
+    """
+
+    def __init__(self, datetime_cols=None, hour_cols=None, time_spec=None):
+        self.datetime_cols = datetime_cols
+        self.hour_cols = hour_cols
+        self.time_spec = time_spec
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        if self.datetime_cols:
+            X, _ = _extract_datetime_features(X, [c for c in self.datetime_cols if c in X.columns],
+                                              hour_cols=set(self.hour_cols or []))
+        spec = self.time_spec
+        if spec and spec["column"] in X.columns:
+            col = spec["column"]
+            parsed = pd.to_datetime(X[col], errors="coerce")
+            X[f"{col}_elapsed_days"] = (parsed - spec["t0"]).dt.total_seconds() / 86400.0
+            for part in spec["parts"]:
+                X[f"{col}_{part}"] = getattr(parsed.dt, part)
+            X = X.drop(columns=[col])
+        return X
+
+
 class InfinityToNaN(BaseEstimator, TransformerMixin):
     """Convert +/-inf to NaN so the downstream imputer can handle it.
 
@@ -356,18 +429,25 @@ def preprocess(
     split_strategy: str = "random",        # "random" | "time"
     time_column: str | None = None,
     group_column: str | None = None,
-    log_transform_target: bool = False,
+    log_transform_target: bool | str = False,   # False | True | "auto"
     auto_datetime_features: bool = True,
     drop_low_variance: bool = True,
     auto_drop_id_columns: bool = True,
     drop_duplicate_rows: bool = True,
     add_missing_indicators: bool = False,
+    add_interactions: bool = False,
 ) -> PreprocessingResult:
     """End-to-end preprocessing.
 
     The two main paths:
       * `df_test` is None -> we split `df` ourselves (random or time-aware)
       * `df_test` is provided -> no split, use it directly. `df_val` optional.
+
+    `log_transform_target="auto"` applies log1p only when the TRAINING target
+    is right-skewed (skew > 1.5) and non-negative. `add_interactions=True`
+    adds pairwise products of numeric features, which lets linear models
+    capture effects such as "size matters more downtown" (a common cause of
+    underfitting).
     """
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in training data.")
@@ -435,6 +515,8 @@ def preprocess(
             profile = profile_dataframe(df, target)
 
     datetime_cols_used: list[str] = []
+    hour_cols: set[str] = set()
+    time_spec: dict | None = None
     if auto_datetime_features and profile["datetime_candidates"]:
         protected = {time_column} if (split_strategy == "time" and time_column) else set()
         datetime_cols_used = [c for c in profile["datetime_candidates"] if c not in protected]
@@ -517,12 +599,27 @@ def preprocess(
     if val_df is not None:
         X_val_raw, y_val, _ = _pop(val_df)
 
-    # also drop the time column from X if it was only used for sorting
+    # After a time-aware split the time column has done its sorting job, but
+    # dropping it outright (as before) hid any TREND from every model: future
+    # test rows then sit above/below anything seen in training and all models
+    # underfit. Instead, turn it into features: elapsed time since the start of
+    # training (lets linear models extrapolate a trend) plus calendar parts.
+    time_features: list[str] = []
     if time_column and time_column in X_train_raw.columns and split_strategy == "time":
-        X_train_raw = X_train_raw.drop(columns=[time_column])
-        X_test_raw  = X_test_raw.drop( columns=[time_column])
+        frames = [X_train_raw, X_test_raw] + ([X_val_raw] if X_val_raw is not None else [])
+        col = X_train_raw[time_column]
+        if pd.api.types.is_numeric_dtype(col):
+            time_features = [time_column]          # already a usable trend feature
+        else:
+            parsed_train = pd.to_datetime(col, errors="coerce")
+            if parsed_train.notna().mean() > 0.85:
+                frames, time_features, time_spec = _time_split_features(frames, time_column,
+                                                                         parsed_train)
+            else:
+                frames = [fr.drop(columns=[time_column]) for fr in frames]
+        X_train_raw, X_test_raw = frames[0], frames[1]
         if X_val_raw is not None:
-            X_val_raw = X_val_raw.drop(columns=[time_column])
+            X_val_raw = frames[2]
 
     # step 6: classify columns now that all extra cols are removed
     numeric_cols, low_card_cat, high_card_cat = [], [], []
@@ -541,12 +638,18 @@ def preprocess(
     # therefore unable to transform new raw data. FrequencyEncoder now lives
     # inside the pipeline, so fitting it stores the lookups and pickling the
     # preprocessor carries them along.
-    numeric_pipe = Pipeline([
+    numeric_steps = [
         ("finite", InfinityToNaN()),
         ("impute", SimpleImputer(strategy="median",
                                  add_indicator=add_missing_indicators)),
         ("scale",  StandardScaler()),
-    ])
+    ]
+    interactions_used = bool(add_interactions and
+                             2 <= len(numeric_cols) <= MAX_INTERACTION_BASE_COLUMNS)
+    if interactions_used:
+        numeric_steps.append(("interact", PolynomialFeatures(degree=2, interaction_only=True,
+                                                             include_bias=False)))
+    numeric_pipe = Pipeline(numeric_steps)
     cat_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="most_frequent")),
         ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
@@ -565,12 +668,28 @@ def preprocess(
     preprocessor = ColumnTransformer(transformers, remainder="drop")
 
     X_train = preprocessor.fit_transform(X_train_raw)
+    raw_preprocessor = Pipeline([
+        ("raw_features", RawFeatureBuilder(datetime_cols=list(datetime_cols_used),
+                                           hour_cols=sorted(hour_cols), time_spec=time_spec)),
+        ("columns", preprocessor),
+    ])
     X_test  = preprocessor.transform(X_test_raw)
     X_val   = preprocessor.transform(X_val_raw) if X_val_raw is not None else None
 
     # step 9: optional target log-transform (applied AFTER the split)
     target_transform: Literal["none", "log1p"] = "none"
-    if log_transform_target:
+    auto_log = isinstance(log_transform_target, str) and log_transform_target.lower() == "auto"
+    train_skew = float(pd.Series(y_train).skew()) if len(y_train) > 2 else 0.0
+    count_like = bool(len(y_train) and (y_train >= 0).all()
+                      and np.allclose(y_train, np.round(y_train)))
+    if auto_log:
+        # decided from TRAINING data only; left skew is not helped by log1p.
+        # Count targets (non-negative integers) stay on their natural scale so
+        # PoissonRegressor, which is built for counts, can be used.
+        want_log = train_skew > LOG_TRANSFORM_SKEW_THRESHOLD and not count_like
+    else:
+        want_log = bool(log_transform_target)
+    if want_log:
         if (y_train < 0).any() or (y_test < 0).any() or (y_val is not None and (y_val < 0).any()):
             # log1p needs non-negative values
             target_transform = "none"
@@ -604,7 +723,11 @@ def preprocess(
         "id_like_columns_dropped": dropped_id_cols,
         "split_strategy_used": split_used,
         "target_transform": target_transform,
-        "target_transform_requested": bool(log_transform_target),
+        "target_transform_requested": ("auto" if auto_log else bool(log_transform_target)),
+        "target_skew_train": train_skew,
+        "target_count_like": count_like,
+        "interaction_features_added": interactions_used,
+        "time_features_from_split_column": time_features,
         "test_size": test_size,
         "random_state": random_state,
         "group_column": group_column if group_column and groups_train is not None else None,
@@ -618,4 +741,5 @@ def preprocess(
         feature_names=feature_names, preprocessor=preprocessor, summary=summary,
         X_val=X_val, y_val=y_val,
         target_transform=target_transform, groups_train=groups_train,
+        raw_preprocessor=raw_preprocessor,
     )
