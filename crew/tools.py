@@ -10,7 +10,15 @@ from typing import Any
 import pandas as pd
 from crewai.tools import tool
 
-from utils.modeling import get_default_model_zoo, rank_models, train_and_evaluate
+from utils.modeling import (
+    BASELINE_MODEL_NAME,
+    explain_selection,
+    filter_zoo_for_data,
+    get_default_model_zoo,
+    rank_models,
+    target_outlier_share,
+    train_and_evaluate,
+)
 from utils.preprocessing import preprocess, profile_dataframe
 
 # Module-level state populated by the orchestrator before crew.kickoff().
@@ -21,7 +29,11 @@ STATE: dict[str, Any] = {
     "split_strategy": "random", "time_column": None, "group_column": None,
     "log_transform_target": False, "auto_datetime_features": True,
     "drop_low_variance": True, "tune_hyperparameters": False,
+    "tuning": "off",
     "profile": None, "preprocessing": None, "results": None,
+    # filled by the orchestrator so every agent names the SAME winner as the app
+    "best_model": None, "selection_note": "", "selection_metric": "rmse",
+    "skipped_models": {}, "failed_models": {},
 }
 
 
@@ -37,7 +49,14 @@ def reset_state() -> None:
     keeps them in exactly one place.
     """
     STATE.clear()
-    STATE.update(_DEFAULT_STATE)
+    STATE.update({k: (dict(v) if isinstance(v, dict) else v) for k, v in _DEFAULT_STATE.items()})
+
+
+def _winner(results) -> tuple[str, str]:
+    """The app's winner (from the orchestrator) or, if absent, the same rule it uses."""
+    if STATE.get("best_model") in (results or {}):
+        return STATE["best_model"], STATE.get("selection_note", "")
+    return explain_selection(results, selection_metric=STATE.get("selection_metric", "rmse"))
 
 
 @tool("Profile dataset")
@@ -164,7 +183,7 @@ def train_models_tool(_: str = "") -> str:
         zoo = get_default_model_zoo(random_state=STATE["random_state"])
         if STATE.get("selected_models"):
             zoo = {k: v for k, v in zoo.items() if k in STATE["selected_models"]}
-
+        zoo, _ = filter_zoo_for_data(zoo, pre.y_train, target_transform=pre.target_transform)
         results = train_and_evaluate(
             pre.X_train, pre.X_test, pre.y_train, pre.y_test,
             models=zoo,
@@ -172,19 +191,29 @@ def train_models_tool(_: str = "") -> str:
             cv_strategy=STATE["cv_strategy"],
             groups_train=pre.groups_train,
             target_transform=pre.target_transform,
-            tune_hyperparameters=STATE["tune_hyperparameters"],
+            tuning=STATE.get("tuning") or ("fast" if STATE["tune_hyperparameters"] else "off"),
             X_val=pre.X_val, y_val=pre.y_val,
             random_state=STATE["random_state"],
         )
         STATE["results"] = results
-    ranked = rank_models(results)
-    lines = ["Trained models (best to worst by RMSE):"]
-    for name, rmse, r2 in ranked:
-        m = results[name].metrics
+    metric = STATE.get("selection_metric", "rmse").upper()
+    key = f"CV_{metric}_mean"
+    order = sorted(results, key=lambda n: results[n].metrics.get(key, float("inf")))
+    lines = [f"Trained models (best to worst by cross-validated {metric} on training rows):"]
+    for name in order:
+        r = results[name]; m = r.metrics
         lines.append(
-            f"  {name}: RMSE={rmse:.4f}, MAE={m['MAE']:.4f}, R²={r2:.4f}"
+            f"  {name}: CV {metric}={m.get(key, float('nan')):.4f}, "
+            f"CV R²={m.get('CV_R2_mean', float('nan')):.4f} ± {m.get('CV_R2_std', float('nan')):.4f}, "
+            f"test RMSE={m['RMSE']:.4f}, test R²={m['R2']:.4f}, fit={r.fit_status}"
+            + (f" [auto-fix: {r.remediation}]" if r.remediation else "")
         )
-    lines.append(f"\nWinner: {ranked[0][0]}")
+    best, note = _winner(results)
+    lines.append(f"\nWinner: {best} — selected by {note}")
+    if STATE.get("skipped_models"):
+        lines.append("Skipped models: " + "; ".join(f"{k} ({v})" for k, v in STATE["skipped_models"].items()))
+    if STATE.get("failed_models"):
+        lines.append("Failed models: " + "; ".join(f"{k} ({v})" for k, v in STATE["failed_models"].items()))
     return "\n".join(lines)
 
 
@@ -194,20 +223,35 @@ def best_model_tool(_: str = "") -> str:
     results = STATE["results"]
     if not results:
         return "ERROR: no models trained yet."
-    ranked = rank_models(results)
-    best = ranked[0][0]
-    m = results[best].metrics
+    best, note = _winner(results)
+    r = results[best]
+    m = r.metrics
     lines = [
-        f"Best model: {best}",
+        f"Best model: {best} (selected by {note})",
+        f"  Fit diagnosis: {r.fit_status} — " + "; ".join(r.fit_reasons),
         f"  RMSE: {m['RMSE']:.4f} (train: {m.get('RMSE_train', float('nan')):.4f})",
         f"  MAE:  {m['MAE']:.4f}",
         f"  R²:   {m['R2']:.4f} (train: {m.get('R2_train', float('nan')):.4f})",
         f"  MedianAE: {m['MedianAE']:.4f}",
     ]
     if "CV_R2_mean" in m:
-        lines.append(f"  CV R²: {m['CV_R2_mean']:.4f} ± {m['CV_R2_std']:.4f}")
-    if "R2_train" in m and m["R2_train"] - m["R2"] > 0.15:
-        lines.append("  ⚠ POSSIBLE OVERFITTING: train R² much higher than test R².")
+        lines.append(f"  CV R²: {m['CV_R2_mean']:.4f} ± {m['CV_R2_std']:.4f}"
+                     + (" (from the tuning search; mildly optimistic)" if r.cv_optimistic else ""))
+    if "Skill_vs_baseline_pct" in m:
+        lines.append(f"  Error reduction vs. predicting the average: {m['Skill_vs_baseline_pct']:.1f}%")
+    if r.best_params:
+        lines.append(f"  Final settings: {r.best_params}")
+    if r.remediation:
+        lines.append(f"  Automatic fix: {r.remediation}")
+    if r.ensemble_members:
+        lines.append(f"  Ensemble of: {', '.join(r.ensemble_members)}")
+    if r.learning_curve:
+        lines.append(f"  Learning curve: {r.learning_curve['reading']}")
+    pi = r.prediction_interval
+    if pi and "test_coverage" in pi:
+        lines.append(f"  {pi['coverage_target']:.0%} prediction interval: covers "
+                     f"{pi['test_coverage']:.0%} of test rows, average width "
+                     f"{pi['mean_width_original_units']:.4g}")
     return "\n".join(lines)
 
 
@@ -273,42 +317,62 @@ def quality_review_tool(_: str = "") -> str:
                 f"More features ({s['n_features_after']}) than training rows "
                 f"({s['n_train']}) — high overfitting risk; prefer regularized models."
             )
+    if df_train is not None and target is not None:
+        y_model = pre.y_train if pre is not None else df_train[target].to_numpy(dtype=float)
+        share = target_outlier_share(y_model)
+        if share > 0.02:
+            issues.append(f"{share:.1%} of target values are extreme outliers; RMSE and R² are "
+                          "dominated by them, so the selection used "
+                          f"{STATE.get('selection_metric', 'rmse').upper()}. Judge models by "
+                          "MAE / MedianAE and consider the Huber model.")
+
     if results:
+        best, note = _winner(results)
         for name, r in results.items():
-            tr, te = r.metrics.get("R2_train"), r.metrics.get("R2")
-            if tr is None or te is None:
+            if name == BASELINE_MODEL_NAME:
                 continue
-            if te > 0.9999 and tr > 0.9999:
+            tr, te = r.metrics.get("R2_train"), r.metrics.get("R2")
+            tag = " (WINNER)" if name == best else ""
+            if tr is not None and te is not None and te > 0.9999 and tr > 0.9999:
                 if leaked_features:
-                    issues.append(
-                        f"{name}: R² ≈ 1.0 on both splits AND a high-correlation "
-                        "feature was found — leakage strongly suggested."
-                    )
+                    issues.append(f"{name}{tag}: R² ≈ 1.0 on both splits AND a high-correlation "
+                                  "feature was found — leakage strongly suggested.")
                 else:
-                    issues.append(
-                        f"{name}: R² ≈ 1.0 on both train and test, but no single "
-                        "feature has > 0.99 correlation with the target. This usually "
-                        "means the dataset is highly predictable (multiple informative "
-                        "features collectively determine the target), not leakage. "
-                        "Worth eyeballing — but the model is probably fine."
-                    )
-            elif tr - te > 0.20:
-                issues.append(
-                    f"{name}: train R² {tr:.3f} >> test R² {te:.3f} → overfitting."
-                )
-            if te < 0:
-                issues.append(f"{name}: negative test R² → worse than predicting the mean.")
-            # Fold-to-fold instability is a better overfitting signal than any
-            # fixed train/test gap: a model can sit inside the gap threshold and
-            # still be a coin flip. CV_R2_std was already collected and shown in
-            # the UI, but never fed the verdict until now.
-            cv_mean = r.metrics.get("CV_R2_mean")
-            cv_std = r.metrics.get("CV_R2_std")
-            if cv_mean is not None and cv_std is not None and cv_std > 0.15:
-                issues.append(
-                    f"{name}: cross-validated R² is unstable "
-                    f"({cv_mean:.3f} ± {cv_std:.3f} across folds) — the score "
-                    "depends heavily on which rows the model saw."
-                )
-    return "Quality review: no major red flags." if not issues \
-        else "Quality review findings:\n  - " + "\n  - ".join(issues)
+                    issues.append(f"{name}{tag}: R² ≈ 1.0 on both train and test, but no single "
+                                  "feature has > 0.99 correlation with the target — probably a "
+                                  "highly predictable dataset rather than leakage. Worth a look.")
+            if r.fit_status == "benign" and name == best:
+                issues.append(f"{name}{tag}: train/held-out gap remains, but stronger "
+                              "regularisation did not reduce held-out error (harmless gap).")
+            if r.fit_status in ("overfit", "underfit", "unstable"):
+                fixed = f" Auto-fix: {r.remediation}." if r.remediation else ""
+                issues.append(f"{name}{tag}: {r.fit_status.upper()} — "
+                              + "; ".join(r.fit_reasons) + "." + fixed)
+            if te is not None and te < 0:
+                issues.append(f"{name}{tag}: negative test R² → worse than predicting the mean.")
+        if STATE.get("split_strategy") == "time" or STATE.get("cv_strategy") == "time":
+            tree_like = [n for n in results if any(k in n for k in (
+                "Tree", "Forest", "Boost", "XGB", "LightGBM", "KNN"))]
+            bad = [n for n in tree_like if results[n].metrics.get("R2", 0) < 0]
+            if bad:
+                issues.append("Time-ordered data: " + ", ".join(bad) + " score below the mean "
+                              "on the future test period. Tree/neighbour models cannot predict "
+                              "values outside the range seen in training, so they fail on "
+                              "trending series; prefer linear models, or predict the change "
+                              "from the previous value instead of the level.")
+        w = results[best]
+        pi = w.prediction_interval
+        if pi and "test_coverage" in pi and pi["test_coverage"] < pi["coverage_target"] - 0.10:
+            issues.append(f"Winner's {pi['coverage_target']:.0%} prediction interval only covered "
+                          f"{pi['test_coverage']:.0%} of test rows — the test data may differ "
+                          "from the training data (distribution shift).")
+        if w.cv_optimistic:
+            issues.append(f"Winner {best} was tuned; its CV score comes from the search itself "
+                          "and is mildly optimistic. Rely on the test score, or enable nested CV.")
+        issues.append(f"Winner: {best} — selected by {note}; fit diagnosis: {w.fit_status}.")
+    for k, v in (STATE.get("failed_models") or {}).items():
+        issues.append(f"{k} failed to train and was left out: {v}")
+    red = [i for i in issues if not i.startswith("Winner:")]
+    if not red:
+        return "Quality review: no major red flags.\n  - " + "\n  - ".join(issues)
+    return "Quality review findings:\n  - " + "\n  - ".join(issues)
