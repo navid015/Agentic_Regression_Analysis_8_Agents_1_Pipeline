@@ -15,158 +15,154 @@ python_version: 3.11
 
 End-to-end agentic regression analysis built with **CrewAI** and **Gradio**.
 
-Upload one CSV (or three: train / val / test) → 8 specialized agents plan, profile, preprocess, train, visualize, audit, and report → explore models in a UI with a per-model dropdown and full comparison views → download the standalone Python script and Jupyter notebook that reproduces everything.
+Upload one CSV (or three: train / val / test) → the pipeline profiles, cleans, trains
+and tunes up to 15 models, **diagnoses every model for over- and underfitting, fixes
+the ones that need it**, builds an ensemble and picks a winner → 8 agents explain the
+results → download a script, notebook and model file that reproduce the exact winner.
 
 ---
 
+## 🎯 How it guards against overfitting and underfitting
 
-## 🤖 8 CrewAI agents
-
-| Agent | Role |
+| Stage | What happens |
 | --- | --- |
-| 🗺️ Planner | Sequences the project |
-| 🔬 EDA Analyst | Profiles dataset, names risky columns with percentages |
-| 🧹 Preprocessor | Imputes, encodes, scales, splits |
-| 🤖 Modeler & Evaluator | Trains models, ranks them, calls out overfitting |
-| 📊 Visualization | Confirms chart inventory |
-| 🧐 Quality Reviewer | Audits for leakage / overfitting → GO / CAUTION / NO-GO |
-| 💻 Code Generator | Describes the reproducible artifacts |
-| 📝 Insight Reporter | Plain-language executive summary |
+| **Prevent** | Regularised defaults (leaf sizes, depth limits, early stopping for boosting); target scaling for SVR and penalised linear models; hyperparameter tuning (Fast by default) over the knobs that control capacity; automatic log transform for skewed targets; optional interaction features for linear models that underfit |
+| **Detect** | Every model gets a label — *good*, *overfit*, *underfit*, *unstable*, or *harmless gap* — computed from cross-validation on the **training rows only** (train-fold vs held-out-fold score, error vs a mean baseline, fold-to-fold spread). The test set is never used for a decision |
+| **Fix** | Over- or underfitting models are retrained with more / less regularisation; the change is kept only if cross-validated error improves by ≥ 1 % |
+| **Choose** | Winner by validation file (if supplied) or cross-validated error, with the **one-standard-error rule** preferring the simplest model that is statistically as good; a top-3 averaging ensemble competes too; the metric switches to MAE automatically when the target has heavy outliers |
+| **Check** | Learning curve for the winner (train vs held-out score as data grows, with a plain-English reading) and a 90 % conformal prediction interval whose coverage is verified on the test set |
 
-## 🤖 Up to 11 regression models + a baseline
+## 🤖 Models
 
-LinearRegression · Ridge · Lasso · ElasticNet · DecisionTree · RandomForest · GradientBoosting · KNN · SVR · *(optional)* XGBoost · LightGBM
+Baseline (mean) · LinearRegression · Ridge · Lasso · ElasticNet · **Huber** (outliers) ·
+**PoissonRegressor** (counts / non-negative targets) · DecisionTree · RandomForest ·
+**ExtraTrees** · GradientBoosting · **HistGradientBoosting** · KNN · SVR · XGBoost · LightGBM ·
+**Ensemble (top-3 average)**
 
-A **mean-prediction baseline** is always trained alongside them. It is never selected as the winner — it exists so every other score is interpretable (“is this model actually better than doing nothing?”) and so a negative R² is obvious rather than mysterious.
+Models that cannot work on a dataset are skipped with a reason (Poisson on negative
+targets, SVR above 15,000 rows). A model that crashes is reported and left out instead
+of stopping the run.
+
+## ⚙️ Main options (Setup tab)
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| Hyperparameter tuning | Fast (10 trials/model) | Off · Fast · Thorough (40) |
+| Selection metric | Auto | RMSE, or MAE when > 2 % of targets are extreme outliers |
+| Automatic over/underfitting fixes | On | |
+| Top-3 ensemble | On | |
+| One-standard-error rule | On | |
+| Interaction features | Off | pairwise products of up to 15 numeric columns |
+| Nested CV for tuned models | Off | honest CV scores for tuned models; much slower |
+| Log-transform target | Auto | Off · Auto (skew > 1.5, non-negative, not a count) · On |
 
 ## 📊 Charts
 
-**Per model** (selected via dropdown):
-Predicted vs Actual · Residuals vs Predicted · Residual Distribution · Q-Q Plot · CV R² Box · Feature Importance
+**Per model:** Predicted vs Actual · Residuals vs Predicted · Residual Distribution ·
+Q-Q Plot · CV R² Box · Feature Importance (held-out permutation importance for the winner)
+· **Learning Curve** (winner)
 
-**Comparison** across all models:
-RMSE / MAE / R² bars · grouped error metrics · CV R² box · training time · predicted-vs-actual overlay
+**Comparison:** RMSE / MAE / R² bars · grouped error metrics · CV R² box · training time ·
+predicted-vs-actual overlay. The metrics table shows each model's fit label, cross-validated
+error, skill vs the mean, tuned settings and any automatic fix.
 
 ## 📁 Generated artifacts
 
-All three are downloadable from the **Code** tab:
-
-- `regression_pipeline.py` — single-file reproducible script
-- `regression_pipeline.ipynb` — same pipeline as a Jupyter notebook
-- `best_model.joblib` — fitted preprocessor + winning model in one object
-
-The bundle is genuinely self-contained: every learned mapping (imputation,
-scaling, one-hot **and** frequency encoding) lives inside the preprocessor, so
-it transforms raw data without any extra state.
+- `regression_pipeline.py` — standalone script; rebuilds the app's **exact** winner
+  (tuned / remediated settings, or the ensemble members) and compares it with the zoo
+- `regression_pipeline.ipynb` — the same, as a notebook
+- `best_model.joblib` — fitted preprocessor + winner, plus its metrics, fit label and
+  prediction interval
 
 ```python
-import joblib, numpy as np, pandas as pd
+import joblib, pandas as pd
+from utils.modeling import predict_with_interval
 
 bundle = joblib.load("best_model.joblib")
-X = bundle["preprocessor"].transform(pd.read_csv("new_rows.csv"))
-pred = bundle["model"].predict(X)
-if bundle["target_transform"] == "log1p":
-    pred = np.expm1(pred)
+pred, low, high = predict_with_interval(bundle, pd.read_csv("new_rows.csv"))
 ```
+
+The bundle's preprocessor accepts **raw rows** (date columns included), but it uses
+custom transformers from `utils/preprocessing.py`, so load it where this project's
+`utils` folder is importable. Manual equivalent: `X = bundle["preprocessor"].transform(df)`,
+`p = bundle["model"].predict(X)`, then `np.expm1(p)` if `bundle["target_transform"] == "log1p"`.
 
 ---
 
 ## 🚀 Quick start
 
 ```bash
-unzip regression_crew.zip
-cd regression_crew
+git clone https://github.com/navid015/Agentic_Regression_Analysis_8_Agents_1_Pipeline.git
+cd Agentic_Regression_Analysis_8_Agents_1_Pipeline
 
-# Python 3.10+
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# (optional) enable XGBoost & LightGBM
-pip install xgboost lightgbm
-
-# (optional) configure an LLM for agent narration
-cp .env.example .env
-# edit .env to set OPENAI_API_KEY or ANTHROPIC_API_KEY
-
-# run
-python app.py
+# optional: enable agent narration (set in the same terminal before starting)
+export OPENAI_API_KEY="sk-..."     # or ANTHROPIC_API_KEY=...
+                                   # PowerShell: $env:OPENAI_API_KEY="sk-..."
+python app.py                      # open http://localhost:7860
 ```
 
-Open `http://localhost:7860`.
+Tests (run from the project folder):
+
+```bash
+pip install pytest
+python -m pytest -q                # 59 tests
+```
 
 ---
 
 ## ✅ Correctness guarantees
 
-The pipeline is written to avoid the leakage and evaluation mistakes that make
-AutoML output look better than it is:
-
 | Guard | What it prevents |
 | --- | --- |
-| Whole-token identifier detection | Deleting real features (`fixed_acidity`, `humidity`, `width`) while still catching `Unnamed: 0` and `customer_id` |
-| Row-index / ID auto-drop | A leftover counter on a target-sorted CSV scoring R² ≈ 1.0 on nothing |
-| Group-aware **split** and CV | The same patient / store appearing on both sides of the split |
-| Time-aware split (refuses to run without a time column) | Training on the future to predict the past |
-| Exact-duplicate removal before splitting | Identical rows straddling the split, leaking the answer |
-| `fit` on train, `transform` elsewhere | Test statistics informing imputation, scaling or encoding |
-| Validation-based model selection | The test set doubling as a selection set |
-| Original-unit CV scorers under `log1p` | Comparing a log-scale CV R² against an original-scale test R² |
+| Whole-token identifier detection | Deleting real features (`fixed_acidity`, `humidity`) while catching `Unnamed: 0`, `customer_id` |
+| Row-index / ID auto-drop | A leftover counter on a target-sorted CSV scoring R² ≈ 1.0 |
+| Group-aware split and CV | The same patient / store on both sides of the split |
+| Time-aware split with trend features | Training on the future; losing the trend (elapsed time is kept; calendar parts only when the training period covers two full cycles) |
+| Exact-duplicate removal before splitting | Identical rows straddling the split |
+| `fit` on train, `transform` elsewhere | Test statistics leaking into imputation, scaling or encoding |
+| Decisions from training CV / validation only | The test set doubling as a selection set |
+| Fold-consistent R² for diagnosis | Misleading per-fold R² on short time-series folds |
+| Original-unit scorers under `log1p` | Comparing log-scale CV scores with original-scale test scores |
 | Two-signal leakage audit | Crying wolf on datasets that are simply very predictable |
-
-Run the suite with:
-
-```bash
-pip install pytest
-pytest -q
-```
-
----
 
 ## 🧩 How it works
 
-The system separates **what to do** (agents) from **how to do it** (deterministic utilities):
-
-- **Agents own strategy and narration.** They decide which steps to run and explain results.
-- **Utilities own execution.** Preprocessing, training, evaluation, and chart generation are pure Python — fast, reproducible, no LLM in the hot path.
-- **CrewAI tools** are the bridge: each tool wraps one utility function.
-
-Whether you set an LLM key or not, you'll get the same numbers from the same data.
-
----
+Agents own **strategy and narration**; deterministic utilities own **execution**. CrewAI
+tools wrap the utilities and read results from a shared state, so every agent reports the
+same numbers — and the same winner — as the app. You get identical numbers with or
+without an LLM key.
 
 ## 📁 Project structure
 
 ```
-regression_crew/
 ├── app.py                       # Gradio UI
 ├── requirements.txt
-├── .env.example
-├── README.md
 ├── crew/
-│   ├── __init__.py
 │   ├── agents.py                # 8 CrewAI agents
-│   ├── tasks.py                 # Task descriptions with concrete expected outputs
-│   ├── tools.py                 # CrewAI tools wrapping the utilities
-│   └── orchestrator.py          # Main runner
+│   ├── tasks.py                 # task descriptions
+│   ├── tools.py                 # tools + quality audit (leakage, fit labels, outliers, coverage)
+│   └── orchestrator.py          # runs everything
 ├── tests/
-│   └── test_pipeline.py      # leakage / metric / selection regression tests
+│   ├── conftest.py
+│   ├── test_pipeline.py         # leakage / metric / selection tests
+│   └── test_fit_quality.py      # over/underfitting prevention, detection, fixing
 └── utils/
-    ├── __init__.py
-    ├── preprocessing.py         # Multi-file, datetime, log-transform, time/group splits
-    ├── modeling.py              # Up to 11 models, CV strategies, optional tuning
-    ├── visualization.py         # Plotly per-model + comparison charts
-    └── code_generator.py        # Emits .py and .ipynb that reflect every option
+    ├── preprocessing.py         # cleaning, splits, auto log, interactions, time features
+    ├── modeling.py              # zoo, tuning, diagnosis, remediation, ensemble, selection
+    ├── visualization.py         # Plotly charts incl. learning curve
+    └── code_generator.py        # .py / .ipynb that rebuild the exact winner
 ```
-
----
 
 ## ⚠️ Scope
 
-See the **Scope & Disclaimer** tab inside the app for the full breakdown. Quick version:
-
-- **Good for:** standard tabular regression with independent rows
-- **Caution for:** time series (use Prophet / sktime), grouped data (use the group-CV option), heavily skewed targets (use log-transform option), tiny datasets (< 50 rows)
-- **Not designed for:** classification, multi-output, survival, quantile regression, images / text / audio, deployment infrastructure, causal inference
+- **Good for:** tabular regression — ordinary, skewed, count and outlier-heavy targets;
+  grouped rows; time-ordered data with a trend; small and wide datasets
+- **Caution:** true forecasting (lags, seasonality — use sktime / Prophet); tiny datasets
+  (< 50 rows); tuning on very large data is slow (turn it off or use Fast)
+- **Not designed for:** classification, multi-output targets, quantile or survival
+  regression, images / text / audio, deployment infrastructure, causal inference
