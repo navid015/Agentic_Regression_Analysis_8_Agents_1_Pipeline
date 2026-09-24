@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import gradio as gr
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -433,7 +434,8 @@ def on_run(
     test_size, random_state, n_folds,
     selected_models, split_strategy, log_target,
     auto_datetime, drop_lowvar, drop_id_cols, drop_dupes, missing_flags,
-    tune_hyperparams, use_agents,
+    tuning_choice, selection_choice, auto_fix, ensemble, one_se, interactions, nested,
+    use_agents,
     state,
 ):
     """Generator: streams timeline updates while the pipeline runs on a thread."""
@@ -517,13 +519,17 @@ def on_run(
                 split_strategy=("time" if split_strategy == "Time-aware" else "random"),
                 time_column=None if time_col in (None, "(none)") else time_col,
                 group_column=None if group_col in (None, "(none)") else group_col,
-                log_transform_target=log_target,
+                log_transform_target={"Off": False, "On": True}.get(log_target, "auto"),
                 auto_datetime_features=auto_datetime,
                 drop_low_variance=drop_lowvar,
                 auto_drop_id_columns=drop_id_cols,
                 drop_duplicate_rows=drop_dupes,
                 add_missing_indicators=missing_flags,
-                tune_hyperparameters=tune_hyperparams,
+                tuning=str(tuning_choice).split(" ")[0].lower(),
+                selection_metric=("mae" if str(selection_choice).startswith("MAE") else
+                                  "rmse" if selection_choice == "RMSE" else "auto"),
+                auto_remediate=auto_fix, build_ensemble=ensemble, one_se_rule=one_se,
+                add_interactions=interactions, nested_cv=nested,
                 use_agents=use_agents,
                 progress_callback=progress_cb,
                 csv_filename=state.get("train_filename") or "train.csv",
@@ -595,9 +601,24 @@ def _metric_card(label: str, value: str, gold: bool = False) -> str:
     return f'<div class="{cls}"><div class="label">{label}</div><div class="value">{value}</div></div>'
 
 
+_FIT_LABEL = {"good": "Good fit", "benign": "Good (harmless gap)",
+              "overfit": "Overfitting", "underfit": "Underfitting",
+              "unstable": "Unstable", "unknown": "Unknown"}
+
+
+def _orig_units(pre, y):
+    """Charts must compare predictions (original units) with actuals in the SAME units.
+    With the log transform on, the stored y arrays are log1p values."""
+    return np.expm1(y) if pre.target_transform == "log1p" else y
+
+
 def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     best = out.best_model
-    bm = out.results[best].metrics
+    wr = out.results[best]
+    bm = wr.metrics
+    pi = wr.prediction_interval or {}
+    y_test_orig = _orig_units(out.preprocessing, out.preprocessing.y_test)
+    y_train_orig = _orig_units(out.preprocessing, out.preprocessing.y_train)
 
     # ---- Overview ----
     cards_html = f"""
@@ -614,6 +635,11 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         {_metric_card("MedianAE", f"{bm['MedianAE']:.4f}")}
         {_metric_card("MAPE", f"{bm.get('MAPE_pct', float('nan')):.2f}%")}
     </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;">
+        {_metric_card("Fit diagnosis", _FIT_LABEL.get(wr.fit_status, wr.fit_status))}
+        {_metric_card("CV R² (mean ± std)", f"{bm.get('CV_R2_mean', float('nan')):.3f} ± {bm.get('CV_R2_std', float('nan')):.3f}")}
+        {_metric_card(f"{int(pi.get('coverage_target', 0.9) * 100)}% interval covers", f"{pi['test_coverage']:.0%} of test rows" if 'test_coverage' in pi else "n/a")}
+    </div>
     """
 
     # plan
@@ -625,13 +651,15 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
             "1. Profile dataset (types, missingness, target stats, datetime/leakage candidates)\n"
             "2. Auto-extract datetime features and drop low-variance columns\n"
             "3. Split into train/test (random or time-aware) — or use user-supplied splits\n"
-            "4. Impute, encode, scale\n"
-            "5. Optionally log-transform the target\n"
-            f"6. Train {len(out.results)} regressors with {out.options_used['cv_folds']}-fold CV\n"
-            "7. Compute MAE / RMSE / R² / MedianAE / MAPE\n"
-            "8. Pick best by lowest test RMSE\n"
-            "9. Generate per-model and comparison charts\n"
-            "10. Emit standalone `.py` script and `.ipynb` notebook"
+            "4. Impute, encode, scale (optionally add interaction features)\n"
+            "5. Log-transform the target if it is skewed (auto)\n"
+            f"6. Train {len(out.results)} regressors (tuning: {out.options_used['tuning']}) "
+            f"with {out.options_used['cv_scheme']}\n"
+            "7. Diagnose every model: good / overfit / underfit / unstable (CV only, test untouched)\n"
+            "8. Automatically retrain over- or underfitting models with better settings\n"
+            "9. Build an ensemble of the top three; pick the winner by validation or CV error "
+            "(one-standard-error rule prefers simpler models)\n"
+            "10. Learning curve + prediction interval for the winner; charts; reproducible code"
         )
 
     # ---- Data & Preprocessing ----
@@ -663,10 +691,14 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     if s.get("id_like_columns_dropped"):
         pre_md += (f"- **ID/row-index columns auto-dropped (would leak if kept):** "
                    f"{s['id_like_columns_dropped']}\n")
+    if s.get("target_transform_requested") == "auto":
+        pre_md += (f"- **Log transform (auto):** training-target skew = "
+                   f"{s.get('target_skew_train', 0):+.2f} → "
+                   f"{'applied' if s['target_transform'] == 'log1p' else 'not needed'}\n")
+    if s.get("interaction_features_added"):
+        pre_md += "- **Interaction features:** pairwise products of numeric columns added\n"
 
-    target_dist_fig = target_distribution_chart(
-        out.preprocessing.y_train, out.options_used["target"]
-    )
+    target_dist_fig = target_distribution_chart(y_train_orig, out.options_used["target"])
 
     eda_md = out.agent_outputs.get("eda") or (
         "*Agent commentary unavailable. Showing raw profile above.*\n\n"
@@ -687,6 +719,10 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         m = r.metrics
         metrics_rows.append({
             "Model": n,
+            "Fit": _FIT_LABEL.get(r.fit_status, r.fit_status),
+            f"CV {out.selection_metric.upper()}": round(
+                m.get(f"CV_{out.selection_metric.upper()}_mean", float("nan")), 4),
+            "Skill vs mean %": round(m.get("Skill_vs_baseline_pct", float("nan")), 1),
             "MAE":  round(m["MAE"], 4),
             "RMSE": round(m["RMSE"], 4),
             "R²":   round(m["R2"], 4),
@@ -701,37 +737,49 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
             "Train time (s)": round(r.train_time_sec, 3),
             "Tuned params": ("" if not r.best_params else
                              ", ".join(f"{k}={v}" for k, v in r.best_params.items())),
+            "Auto-fix": r.remediation or "",
         })
-    metrics_df = pd.DataFrame(metrics_rows).sort_values("RMSE").reset_index(drop=True)
+    metrics_df = pd.DataFrame(metrics_rows).sort_values(
+        f"CV {out.selection_metric.upper()}", na_position="last").reset_index(drop=True)
     # Hide columns that carry no information for this run (no validation set
     # supplied, or tuning switched off) rather than showing a wall of NaN.
     for _col in ("RMSE (val)", "R² (val)"):
         if _col in metrics_df and metrics_df[_col].isna().all():
             metrics_df = metrics_df.drop(columns=[_col])
-    if "Tuned params" in metrics_df and not metrics_df["Tuned params"].str.strip().any():
-        metrics_df = metrics_df.drop(columns=["Tuned params"])
+    for _col in ("Tuned params", "Auto-fix"):
+        if _col in metrics_df and not metrics_df[_col].str.strip().any():
+            metrics_df = metrics_df.drop(columns=[_col])
 
     # build a markdown header above the table indicating winners — avoids
     # the unreadable-highlight issue from the Streamlit version
     best_rmse = metrics_df.loc[metrics_df["RMSE"].idxmin(), "Model"]
     best_mae  = metrics_df.loc[metrics_df["MAE"].idxmin(),  "Model"]
     best_r2   = metrics_df.loc[metrics_df["R²"].idxmax(),   "Model"]
-    basis = getattr(out, "selection_basis", "test")
-    basis_note = (
-        "selected on the **validation** set, so the test metrics below remain an "
-        "unbiased estimate"
-        if basis == "validation" else
-        "selected on the **test** set — no validation file was supplied, so the "
-        "winner's test score is mildly optimistic"
-    )
+    basis = getattr(out, "selection_basis", "cv")
+    basis_note = {
+        "validation": "selected on the **validation** file",
+        "cv": "selected by **cross-validation on the training rows**",
+        "test": "selected on the **test** set (cross-validation was unavailable), so its "
+                "test score is mildly optimistic",
+    }.get(basis, basis)
+    extra = ""
+    if out.skipped_models:
+        extra += "\n\n**Skipped:** " + "; ".join(f"`{k}` — {v}" for k, v in out.skipped_models.items())
+    if out.failed_models:
+        extra += "\n\n**Failed:** " + "; ".join(f"`{k}` — {v}" for k, v in out.failed_models.items())
+    counts = out.options_used.get("fit_status_counts", {})
     winners_md = (
-        f"🏆 **Overall winner:** `{best}` — {basis_note}.\n\n"
-        f"**Best by RMSE:** `{best_rmse}` &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"**Best by MAE:** `{best_mae}` &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"**Best by R²:** `{best_r2}`"
+        f"🏆 **Overall winner:** `{best}` — {basis_note}; rule: {out.selection_note}. "
+        f"The test set was not used for any decision, so its scores are an honest estimate.\n\n"
+        f"**Selection metric:** {out.selection_metric_reason}.  "
+        f"**Fit check across models:** " + ", ".join(f"{_FIT_LABEL.get(k, k)}: {v}"
+                                                       for k, v in counts.items()) + "\n\n"
+        f"**Best test RMSE:** `{best_rmse}` &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"**Best test MAE:** `{best_mae}` &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"**Best test R²:** `{best_r2}`" + extra
     )
 
-    cc = comparison_charts(out.results, out.preprocessing.y_test)
+    cc = comparison_charts(out.results, y_test_orig)
     cc_keys = list(cc.keys())
     cc_figs = [cc[k] for k in cc_keys]
     # pad to fixed slots so Gradio outputs match
@@ -744,17 +792,14 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     model_names = list(out.results.keys())
     default_model = best
     pm_charts = per_model_charts(
-        default_model, out.preprocessing.y_test,
+        default_model, y_test_orig,
         out.results[default_model].y_pred_test,
         out.results[default_model].cv_scores.get("R2"),
-        out.results[default_model].feature_importances,
+        _importances_for(out.results[default_model]),
         out.preprocessing.feature_names,
+        learning_curve=out.results[default_model].learning_curve,
     )
-    pm_keys = list(pm_charts.keys())
-    pm_figs = [pm_charts.get(k) for k in
-               ["Predicted vs Actual", "Residuals vs Predicted",
-                "Residual Distribution", "Q-Q Plot",
-                "CV R² Distribution", "Feature Importance"]]
+    pm_figs = [pm_charts.get(k) for k in _PM_CHART_ORDER]
 
     pm_metric_html = _per_model_metric_html(default_model, out.results[default_model])
 
@@ -786,7 +831,7 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
         gr.update(value=modeler_md),                # modeler commentary
         gr.update(choices=model_names, value=default_model),  # model dropdown
         gr.update(value=pm_metric_html),            # per-model metric cards
-        *[gr.update(value=f) for f in pm_figs],     # 6 per-model plots
+        *[gr.update(value=f) for f in pm_figs],     # 7 per-model plots
         gr.update(value=out.generated_script),      # code preview
         gr.update(value=str(py_path)),              # py download
         gr.update(value=str(nb_path)),              # ipynb download
@@ -796,51 +841,71 @@ def _render_results(out: PipelineOutput, df_preview: pd.DataFrame):
     )
 
 
+_PM_CHART_ORDER = ["Predicted vs Actual", "Residuals vs Predicted", "Residual Distribution",
+                   "Q-Q Plot", "CV R² Distribution", "Feature Importance", "Learning Curve"]
+
+
+def _importances_for(result):
+    """Prefer held-out permutation importance (winner) over built-in importance."""
+    if result.permutation_importances is not None:
+        return result.permutation_importances
+    return result.feature_importances
+
+
 def _per_model_metric_html(name: str, result) -> str:
     m = result.metrics
-    overfit = ""
-    if "R2_train" in m and m["R2_train"] - m["R2"] > 0.15:
-        overfit = (f'<div class="scope-warn" style="margin-top:8px;">⚠️ Possible overfitting: '
-                   f'train R² = {m["R2_train"]:.3f}, test R² = {m["R2"]:.3f}</div>')
+    status = result.fit_status
+    css = "scope-good" if status in ("good", "benign") else "scope-warn"
+    reasons = "; ".join(_html_mod.escape(x) for x in result.fit_reasons)
+    diag = (f'<div class="{css}" style="margin-top:8px;"><b>Fit diagnosis: '
+            f'{_FIT_LABEL.get(status, status)}</b> — {reasons}</div>')
+    if result.remediation:
+        diag += (f'<div class="scope-warn" style="margin-top:6px;">🔧 <b>Automatic fix:</b> '
+                 f'{_html_mod.escape(result.remediation)}</div>')
     if m.get("R2", 0) > 0.9999 and m.get("R2_train", 0) > 0.9999:
-        overfit = ('<div class="scope-warn" style="margin-top:8px;">'
-                   'ℹ️ R² ≈ 1.0 on both train AND test. This <i>can</i> mean '
-                   'target leakage (a feature is a near-duplicate of the target), '
-                   'but it can also just mean the dataset is highly predictable '
-                   '(e.g. diamonds, where carat alone explains ~85% of price '
-                   'variance). The Quality Reviewer in the Narrative tab does a '
-                   'more careful check using feature-target correlations.'
-                   '</div>')
-    cv = ""
+        diag += ('<div class="scope-warn" style="margin-top:6px;">ℹ️ R² ≈ 1.0 on both train '
+                 'and test. This can mean target leakage, or simply a very predictable dataset. '
+                 'See the Quality Reviewer in the Narrative tab.</div>')
+    extras = []
     if "CV_R2_mean" in m:
-        cv = f"<small style='color:#6b7280;'>CV R²: {m['CV_R2_mean']:.4f} ± {m['CV_R2_std']:.4f}</small>"
-    cards = f"""
+        extras.append(f"CV R²: {m['CV_R2_mean']:.4f} ± {m['CV_R2_std']:.4f}"
+                      + (" (from tuning search — mildly optimistic)" if result.cv_optimistic else ""))
+    if "CV_R2_train_mean" in m:
+        extras.append(f"train-fold R²: {m['CV_R2_train_mean']:.4f}")
+    if "Skill_vs_baseline_pct" in m:
+        extras.append(f"error reduction vs mean: {m['Skill_vs_baseline_pct']:.1f}%")
+    if result.best_params:
+        extras.append("settings: " + ", ".join(f"{k}={v}" for k, v in result.best_params.items()))
+    if result.ensemble_members:
+        extras.append("members: " + ", ".join(result.ensemble_members))
+    pi = result.prediction_interval or {}
+    if "test_coverage" in pi:
+        extras.append(f"{pi['coverage_target']:.0%} interval: covers {pi['test_coverage']:.0%} of "
+                      f"test rows, avg width {pi['mean_width_original_units']:.4g}")
+    extra_html = "<br>".join(_html_mod.escape(x) for x in extras)
+    return f"""
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
       {_metric_card("Model", name, gold=True)}
       {_metric_card("RMSE", f"{m['RMSE']:.4f}")}
       {_metric_card("MAE",  f"{m['MAE']:.4f}")}
       {_metric_card("R²",   f"{m['R2']:.4f}")}
     </div>
-    <div style="margin-top:6px;">{cv}</div>
-    {overfit}
+    <div style="margin-top:6px;"><small style='color:#9ca3af;'>{extra_html}</small></div>
+    {diag}
     """
-    return cards
 
 
 def on_model_dropdown_change(model_name: str, state: dict):
     out: PipelineOutput | None = (state or {}).get("output")
     if out is None or model_name not in out.results:
-        return (gr.update(),) * 7
+        return (gr.update(),) * (1 + len(_PM_CHART_ORDER))
     res = out.results[model_name]
     charts = per_model_charts(
-        model_name, out.preprocessing.y_test, res.y_pred_test,
-        res.cv_scores.get("R2"), res.feature_importances,
-        out.preprocessing.feature_names,
+        model_name, _orig_units(out.preprocessing, out.preprocessing.y_test),
+        res.y_pred_test, res.cv_scores.get("R2"), _importances_for(res),
+        out.preprocessing.feature_names, learning_curve=res.learning_curve,
     )
-    figs = [charts.get(k) for k in
-            ["Predicted vs Actual", "Residuals vs Predicted",
-             "Residual Distribution", "Q-Q Plot",
-             "CV R² Distribution", "Feature Importance"]]
+    figs = [charts.get(k) for k in _PM_CHART_ORDER]
     return (gr.update(value=_per_model_metric_html(model_name, res)),
             *[gr.update(value=f) for f in figs])
 
@@ -966,14 +1031,31 @@ def build_ui():
                             label="Models to train",
                         )
 
+                        with gr.Accordion("Over- / underfitting controls", open=True):
+                            tuning_radio = gr.Radio(
+                                ["Off", "Fast (10 trials per model)", "Thorough (40 trials per model)"],
+                                value="Fast (10 trials per model)",
+                                label="Hyperparameter tuning (searches depth, leaf size, penalties, "
+                                      "learning rate — the knobs that control over/underfitting)")
+                            selection_radio = gr.Radio(
+                                ["Auto", "RMSE", "MAE (robust to outliers)"], value="Auto",
+                                label="Selection metric (Auto switches to MAE when the target has "
+                                      "heavy outliers)")
+                            auto_fix_cb  = gr.Checkbox(True, label="Automatically retrain models that over- or underfit")
+                            ensemble_cb  = gr.Checkbox(True, label="Add an ensemble of the top 3 models (averaging reduces overfitting)")
+                            one_se_cb    = gr.Checkbox(True, label="Prefer a simpler model when it is statistically as good (one-standard-error rule)")
+                            interact_cb  = gr.Checkbox(False, label="Add interaction features (helps linear models that underfit)")
+                            nested_cb    = gr.Checkbox(False, label="Nested CV for tuned models (honest CV scores; much slower)")
+
                         with gr.Accordion("Advanced options", open=False):
-                            log_target_cb     = gr.Checkbox(False, label="Log-transform target (skewed targets)")
+                            log_target_cb     = gr.Radio(["Off", "Auto (if skewed)", "On"],
+                                                         value="Auto (if skewed)",
+                                                         label="Log-transform target")
                             auto_dt_cb        = gr.Checkbox(True,  label="Auto-extract datetime features")
                             drop_lowvar_cb    = gr.Checkbox(True,  label="Drop low-variance columns")
                             drop_id_cb        = gr.Checkbox(True,  label="Auto-drop ID/row-index columns (recommended — prevents subtle leakage when data is sorted)")
                             drop_dupes_cb     = gr.Checkbox(True,  label="Drop exact duplicate rows before splitting (recommended — duplicates across the split leak the answer)")
                             missing_flags_cb  = gr.Checkbox(False, label="Add missing-value indicator features (missingness is often informative)")
-                            tune_cb           = gr.Checkbox(False, label="Hyperparameter tuning (slower)")
 
                         gr.Markdown("### 5. CrewAI agent narration")
                         if has_llm:
@@ -1073,6 +1155,7 @@ def build_ui():
                 with gr.Row():
                     pm_plot5 = gr.Plot()
                     pm_plot6 = gr.Plot()
+                pm_plot7 = gr.Plot()   # learning curve (computed for the winner)
 
             # =================== CODE TAB ===================
             with gr.Tab("💻 Code"):
@@ -1136,7 +1219,7 @@ def build_ui():
             modeler_commentary,
             # Per-model
             model_dropdown, pm_metrics,
-            pm_plot1, pm_plot2, pm_plot3, pm_plot4, pm_plot5, pm_plot6,
+            pm_plot1, pm_plot2, pm_plot3, pm_plot4, pm_plot5, pm_plot6, pm_plot7,
             # Code
             code_preview, py_download, nb_download, bundle_download, code_commentary,
             # Narrative
@@ -1148,7 +1231,8 @@ def build_ui():
             test_size, random_state, n_folds,
             models_cb, split_strategy, log_target_cb,
             auto_dt_cb, drop_lowvar_cb, drop_id_cb, drop_dupes_cb, missing_flags_cb,
-            tune_cb, use_agents_cb, state,
+            tuning_radio, selection_radio, auto_fix_cb, ensemble_cb, one_se_cb,
+            interact_cb, nested_cb, use_agents_cb, state,
         ]
 
         # Keep the placeholder count in lockstep with the real component list.
@@ -1162,7 +1246,7 @@ def build_ui():
         model_dropdown.change(
             on_model_dropdown_change,
             [model_dropdown, state],
-            [pm_metrics, pm_plot1, pm_plot2, pm_plot3, pm_plot4, pm_plot5, pm_plot6],
+            [pm_metrics, pm_plot1, pm_plot2, pm_plot3, pm_plot4, pm_plot5, pm_plot6, pm_plot7],
         )
 
     return demo
