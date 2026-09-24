@@ -1,378 +1,322 @@
 """
-CrewAI tools — wrap deterministic utilities, return concrete numbers
-so the agents can write specific commentary instead of vague summaries.
+CrewAI tools, built PER RUN.
+
+v3 changes
+----------
+* No module-level STATE. The old global dict was shared by every user of the
+  Gradio app, so two concurrent runs overwrote each other's data and agents
+  could narrate someone else's results. `build_tools(out)` binds tools to one
+  run's output through closures.
+* The report functions are plain Python (`*_text(out)`), testable without
+  CrewAI or an LLM; the tool wrappers are created lazily.
+* Fixed: "log-transform was requested but skipped (target contains negative
+  values)" was printed whenever auto mode declined the log, and the skew
+  warning never fired because the string "auto" is truthy.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import pandas as pd
-from crewai.tools import tool
+import numpy as np
 
-from utils.modeling import (
-    BASELINE_MODEL_NAME,
-    explain_selection,
-    filter_zoo_for_data,
-    get_default_model_zoo,
-    rank_models,
-    target_outlier_share,
-    train_and_evaluate,
-)
-from utils.preprocessing import preprocess, profile_dataframe
-
-# Module-level state populated by the orchestrator before crew.kickoff().
-STATE: dict[str, Any] = {
-    "df_train": None, "df_val": None, "df_test": None,
-    "target": None, "test_size": 0.2, "random_state": 42,
-    "selected_models": None, "cv_folds": 5, "cv_strategy": "kfold",
-    "split_strategy": "random", "time_column": None, "group_column": None,
-    "log_transform_target": False, "auto_datetime_features": True,
-    "drop_low_variance": True, "tune_hyperparameters": False,
-    "tuning": "off",
-    "profile": None, "preprocessing": None, "results": None,
-    # filled by the orchestrator so every agent names the SAME winner as the app
-    "best_model": None, "selection_note": "", "selection_metric": "rmse",
-    "skipped_models": {}, "failed_models": {},
-}
+from utils.modeling import BASELINE_MODEL_NAME, ENSEMBLE_NAME, target_outlier_share
 
 
-_DEFAULT_STATE: dict[str, Any] = dict(STATE)
+def _fmt(v, spec=".4f"):
+    try:
+        return format(float(v), spec) if v is not None and np.isfinite(float(v)) else "n/a"
+    except Exception:
+        return "n/a"
 
 
-def reset_state() -> None:
-    """Restore STATE to its declared defaults.
+# ---- report functions ----------------------------------------------------------------
 
-    Previously this blanked every key to None and then re-applied only some of
-    them by hand, so any default not repeated in that literal was silently lost
-    and the two lists could drift apart. Snapshotting the declared defaults once
-    keeps them in exactly one place.
-    """
-    STATE.clear()
-    STATE.update({k: (dict(v) if isinstance(v, dict) else v) for k, v in _DEFAULT_STATE.items()})
-
-
-def _winner(results) -> tuple[str, str]:
-    """The app's winner (from the orchestrator) or, if absent, the same rule it uses."""
-    if STATE.get("best_model") in (results or {}):
-        return STATE["best_model"], STATE.get("selection_note", "")
-    return explain_selection(results, selection_metric=STATE.get("selection_metric", "rmse"))
-
-
-@tool("Profile dataset")
-def profile_dataset_tool(_: str = "") -> str:
-    """Profile the training set: shape, dtypes, missingness, target stats,
-    datetime candidates, low-variance columns, high-cardinality columns.
-    """
-    df = STATE["df_train"]
-    target = STATE["target"]
-    if df is None or target is None:
-        return "ERROR: dataset and target must be loaded before profiling."
-    # Read-through cache. The orchestrator already profiled the data before
-    # kicking off the crew; recomputing here doubled the work on every run.
-    p = STATE.get("profile")
-    if p is None:
-        p = profile_dataframe(df, target)
-        STATE["profile"] = p
-
+def profile_text(out) -> str:
+    p = out.profile
+    ts = p["target_stats"]
     lines = [
-        f"Shape: {p['n_rows']} rows × {p['n_cols']} cols",
-        f"Target: '{p['target']}'",
-        f"  mean={p['target_stats']['mean']:.3f}, std={p['target_stats']['std']:.3f}, "
-        f"min={p['target_stats']['min']:.3f}, max={p['target_stats']['max']:.3f}, "
-        f"skew={p['target_stats']['skew']:+.2f}",
+        f"Shape: {p['n_rows']} rows x {p['n_cols']} cols",
+        f"Target: '{p['target']}'  mean={_fmt(ts['mean'], '.3f')}, std={_fmt(ts['std'], '.3f')}, "
+        f"min={_fmt(ts['min'], '.3f')}, max={_fmt(ts['max'], '.3f')}, skew={ts['skew']:+.2f}",
         f"Total missing values: {p['missing_total']}",
     ]
-
-    # type breakdown
-    n_num = sum(1 for c in p["columns"] if c["kind"] == "numeric")
-    n_cat = sum(1 for c in p["columns"] if c["kind"] == "categorical")
-    n_dt  = sum(1 for c in p["columns"] if c["kind"] == "datetime")
-    lines.append(f"Feature types: {n_num} numeric, {n_cat} categorical, {n_dt} datetime")
-
-    # specific findings
-    if p["datetime_candidates"]:
-        lines.append(f"Datetime columns detected: {p['datetime_candidates']}")
-    if p["low_variance_columns"]:
-        lines.append(f"Low-variance columns (will be dropped): {p['low_variance_columns']}")
-    if p["high_cardinality_columns"]:
-        lines.append(f"High-cardinality categoricals (will be frequency-encoded): "
-                     f"{p['high_cardinality_columns']}")
-
-    # missingness — list top offenders
-    high_missing = sorted(
-        [(c["name"], c["missing_pct"]) for c in p["columns"] if c["missing_pct"] > 5],
-        key=lambda x: -x[1],
-    )[:5]
+    kinds: dict[str, int] = {}
+    for c in p["columns"]:
+        kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
+    lines.append("Column kinds: " + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items())))
+    for key, label in (("datetime_candidates", "Datetime columns"),
+                       ("low_variance_columns", "Low-variance columns (dropped)"),
+                       ("high_cardinality_columns", "High-cardinality categoricals"),
+                       ("id_like_columns", "Row-counter / ID columns (dropped)"),
+                       ("id_suspect_columns", "Unique sorted integer columns (KEPT, check them)"),
+                       ("numeric_string_columns", "Numbers stored as text (parsed)"),
+                       ("numeric_coded_categoricals", "Integer codes treated as categories")):
+        if p.get(key):
+            lines.append(f"{label}: {p[key]}")
+    high_missing = sorted([(c["name"], c["missing_pct"]) for c in p["columns"] if c["missing_pct"] > 5],
+                          key=lambda x: -x[1])[:5]
     if high_missing:
-        lines.append("Columns with >5% missing: " +
-                     ", ".join(f"{n}({pct:.1f}%)" for n, pct in high_missing))
-
-    if abs(p["target_stats"]["skew"]) > 1.5:
-        lines.append(f"Target is heavily skewed (skew={p['target_stats']['skew']:+.2f}) — "
-                     "consider log-transform.")
+        lines.append("Columns with >5% missing: " + ", ".join(f"{n}({pct:.1f}%)" for n, pct in high_missing))
     return "\n".join(lines)
 
 
-@tool("Preprocess dataset")
-def preprocess_dataset_tool(_: str = "") -> str:
-    """Run preprocessing using the options stored in STATE.
-
-    Stores the result for downstream tools.
-    """
-    if STATE["df_train"] is None or STATE["target"] is None:
-        return "ERROR: dataset and target must be loaded first."
-    # Read-through cache: the orchestrator already preprocessed before kicking
-    # off the crew. Recomputing here ran the whole pipeline twice per request.
-    result = STATE.get("preprocessing")
-    if result is None:
-        try:
-            result = preprocess(
-                STATE["df_train"], STATE["target"],
-                df_val=STATE["df_val"], df_test=STATE["df_test"],
-                test_size=STATE["test_size"], random_state=STATE["random_state"],
-                split_strategy=STATE["split_strategy"], time_column=STATE["time_column"],
-                group_column=STATE["group_column"],
-                log_transform_target=STATE["log_transform_target"],
-                auto_datetime_features=STATE["auto_datetime_features"],
-                drop_low_variance=STATE["drop_low_variance"],
-            )
-        except ValueError as e:
-            return f"ERROR: {e}"
-        STATE["preprocessing"] = result
-    s = result.summary
+def preprocess_text(out) -> str:
+    s = out.preprocessing.summary
+    d = out.target_transform_decision or {}
     lines = [
-        f"Train rows: {s['n_train']}, Test rows: {s['n_test']}, "
-        f"Val rows: {s['n_val']}",
-        f"Features after encoding: {s['n_features_after']}",
-        f"  numeric: {len(s['numeric_cols'])}",
-        f"  one-hot encoded: {len(s['low_cardinality_categorical'])}",
-        f"  frequency-encoded (high-card): "
-        f"{len(s['high_cardinality_categorical_freq_encoded'])}",
+        f"Train rows: {s['n_train']}, Test rows: {s['n_test']}, Val rows: {s['n_val']}",
+        f"Features after encoding: {s['n_features_after']} (numeric {len(s['numeric_cols'])}, "
+        f"one-hot {len(s['low_cardinality_categorical'])}, "
+        f"{s.get('high_cardinality_encoding', 'target')}-encoded {len(s['high_cardinality_categorical'])})",
         f"Split strategy: {s['split_strategy_used']}",
-        f"Target transform: {s['target_transform']}",
+        "Preprocessing is fitted inside every cross-validation fold (no held-out statistics leak in).",
     ]
-    if s.get("datetime_cols_extracted"):
-        lines.append(f"Datetime features extracted from: {s['datetime_cols_extracted']}")
-    if s.get("low_variance_dropped"):
-        lines.append(f"Dropped low-variance columns: {s['low_variance_dropped']}")
-    if s.get("id_like_columns_dropped"):
-        lines.append(f"Dropped ID/row-index columns: {s['id_like_columns_dropped']}")
+    if d.get("method") == "cv":
+        errs = d.get("errors", {})
+        lines.append(f"Target transform: {s['target_transform']} - chosen by cross-validation "
+                     f"(best CV error raw={_fmt(errs.get('none'), '.4g')}, "
+                     f"log1p={_fmt(errs.get('log1p'), '.4g')})")
+    elif d.get("method") == "rule":
+        lines.append(f"Target transform: none - auto mode: {d.get('reason', '')} "
+                     f"(training-target skew {s.get('target_skew_train', 0.0):+.2f})")
+    else:
+        lines.append(f"Target transform: {s['target_transform']} ({s.get('target_transform_reason', '')})")
+    for key, label in (("datetime_cols_extracted", "Datetime features extracted from"),
+                       ("low_variance_dropped", "Dropped low-variance columns"),
+                       ("id_like_columns_dropped", "Dropped row-counter / ID columns"),
+                       ("numeric_string_columns_parsed", "Parsed formatted numbers in"),
+                       ("categorical_overrides", "Treated as categories"),
+                       ("user_dropped_columns", "Dropped at your request")):
+        if s.get(key):
+            lines.append(f"{label}: {s[key]}")
     if s.get("duplicate_rows_dropped"):
         lines.append(f"Dropped exact duplicate rows: {s['duplicate_rows_dropped']}")
     if s.get("infinite_values_sanitized"):
-        lines.append("Infinite values converted to missing: "
-                     f"{s['infinite_values_sanitized']}")
-    if s.get("target_transform_requested") and s.get("target_transform") == "none":
-        lines.append("NOTE: log-transform was requested but skipped "
-                     "(target contains negative values).")
+        lines.append(f"Infinite values converted to missing: {s['infinite_values_sanitized']}")
     return "\n".join(lines)
 
 
-@tool("Train and evaluate models")
-def train_models_tool(_: str = "") -> str:
-    """Train every regressor; compute MAE/RMSE/R²/MAPE plus CV scores."""
-    pre = STATE["preprocessing"]
-    if pre is None:
-        return "ERROR: must run preprocessing before training."
-
-    # Read-through cache. Retraining every model here doubled the single most
-    # expensive operation in the pipeline (and tripled it with tuning on).
-    results = STATE.get("results")
-    if results is None:
-        zoo = get_default_model_zoo(random_state=STATE["random_state"])
-        if STATE.get("selected_models"):
-            zoo = {k: v for k, v in zoo.items() if k in STATE["selected_models"]}
-        zoo, _ = filter_zoo_for_data(zoo, pre.y_train, target_transform=pre.target_transform)
-        results = train_and_evaluate(
-            pre.X_train, pre.X_test, pre.y_train, pre.y_test,
-            models=zoo,
-            cv_folds=STATE["cv_folds"],
-            cv_strategy=STATE["cv_strategy"],
-            groups_train=pre.groups_train,
-            target_transform=pre.target_transform,
-            tuning=STATE.get("tuning") or ("fast" if STATE["tune_hyperparameters"] else "off"),
-            X_val=pre.X_val, y_val=pre.y_val,
-            random_state=STATE["random_state"],
-        )
-        STATE["results"] = results
-    metric = STATE.get("selection_metric", "rmse").upper()
-    key = f"CV_{metric}_mean"
-    order = sorted(results, key=lambda n: results[n].metrics.get(key, float("inf")))
-    lines = [f"Trained models (best to worst by cross-validated {metric} on training rows):"]
-    for name in order:
-        r = results[name]; m = r.metrics
-        lines.append(
-            f"  {name}: CV {metric}={m.get(key, float('nan')):.4f}, "
-            f"CV R²={m.get('CV_R2_mean', float('nan')):.4f} ± {m.get('CV_R2_std', float('nan')):.4f}, "
-            f"test RMSE={m['RMSE']:.4f}, test R²={m['R2']:.4f}, fit={r.fit_status}"
-            + (f" [auto-fix: {r.remediation}]" if r.remediation else "")
-        )
-    best, note = _winner(results)
-    lines.append(f"\nWinner: {best} — selected by {note}")
-    if STATE.get("skipped_models"):
-        lines.append("Skipped models: " + "; ".join(f"{k} ({v})" for k, v in STATE["skipped_models"].items()))
-    if STATE.get("failed_models"):
-        lines.append("Failed models: " + "; ".join(f"{k} ({v})" for k, v in STATE["failed_models"].items()))
+def models_text(out) -> str:
+    M = out.selection_metric.upper()
+    key = f"CV_{M}_mean"
+    res = out.results
+    order = sorted(res, key=lambda n: res[n].metrics.get(key, float("inf")))
+    lines = [f"Models, best to worst by cross-validated {M} on the training rows "
+             "(all models scored on the SAME folds):"]
+    for n in order:
+        r, m = res[n], res[n].metrics
+        lines.append(f"  {n}: CV {M}={_fmt(m.get(key))}, CV R2={_fmt(m.get('CV_R2_mean'))} "
+                     f"+/- {_fmt(m.get('CV_R2_std'))}, fit={r.fit_status}"
+                     + (" [tuned]" if r.best_params else "")
+                     + (f" [auto-fix: {r.remediation}]" if r.remediation else ""))
+    if (out.diagnostics or {}).get("probe_cv_error") is not None:
+        lines.append(f"Reference flexible model (capacity probe) CV {M}: "
+                     f"{_fmt(out.diagnostics['probe_cv_error'])} - used to decide under- vs low-signal.")
+    lines.append(f"\nWinner: {out.best_model} - selected by {out.selection_note}")
+    if out.skipped_models:
+        lines.append("Skipped: " + "; ".join(f"{k} ({v})" for k, v in out.skipped_models.items()))
+    if out.failed_models:
+        lines.append("Failed: " + "; ".join(f"{k} ({v})" for k, v in out.failed_models.items()))
+    lines.append("Test-set scores are reported separately and were not used for any decision.")
     return "\n".join(lines)
 
 
-@tool("Get best model summary")
-def best_model_tool(_: str = "") -> str:
-    """Detailed metrics for the winning model."""
-    results = STATE["results"]
-    if not results:
-        return "ERROR: no models trained yet."
-    best, note = _winner(results)
-    r = results[best]
+def best_model_text(out) -> str:
+    r = out.results[out.best_model]
     m = r.metrics
-    lines = [
-        f"Best model: {best} (selected by {note})",
-        f"  Fit diagnosis: {r.fit_status} — " + "; ".join(r.fit_reasons),
-        f"  RMSE: {m['RMSE']:.4f} (train: {m.get('RMSE_train', float('nan')):.4f})",
-        f"  MAE:  {m['MAE']:.4f}",
-        f"  R²:   {m['R2']:.4f} (train: {m.get('R2_train', float('nan')):.4f})",
-        f"  MedianAE: {m['MedianAE']:.4f}",
-    ]
+    lines = [f"Best model: {out.best_model} (selected by {out.selection_note})",
+             f"  Fit diagnosis: {r.fit_status} - " + "; ".join(r.fit_reasons),
+             f"  Test RMSE {_fmt(m['RMSE'])}, MAE {_fmt(m['MAE'])}, R2 {_fmt(m['R2'])}, "
+             f"MedianAE {_fmt(m['MedianAE'])}"]
     if "CV_R2_mean" in m:
-        lines.append(f"  CV R²: {m['CV_R2_mean']:.4f} ± {m['CV_R2_std']:.4f}"
-                     + (" (from the tuning search; mildly optimistic)" if r.cv_optimistic else ""))
+        lines.append(f"  CV R2 {_fmt(m['CV_R2_mean'])} +/- {_fmt(m['CV_R2_std'])}"
+                     + (" (hyperparameters were chosen on these rows: mildly optimistic)"
+                        if r.cv_optimistic else ""))
     if "Skill_vs_baseline_pct" in m:
-        lines.append(f"  Error reduction vs. predicting the average: {m['Skill_vs_baseline_pct']:.1f}%")
+        lines.append(f"  Error reduction vs predicting the average: {m['Skill_vs_baseline_pct']:.1f}%")
+    if r.smearing_factor:
+        lines.append(f"  Log-target bias correction (smearing factor {r.smearing_factor:.4f}) applied; "
+                     f"uncorrected test RMSE {_fmt(m.get('RMSE_uncorrected'))}")
     if r.best_params:
         lines.append(f"  Final settings: {r.best_params}")
     if r.remediation:
         lines.append(f"  Automatic fix: {r.remediation}")
     if r.ensemble_members:
-        lines.append(f"  Ensemble of: {', '.join(r.ensemble_members)}")
+        lines.append(f"  Ensemble of (one per model family): {', '.join(r.ensemble_members)}")
     if r.learning_curve:
         lines.append(f"  Learning curve: {r.learning_curve['reading']}")
     pi = r.prediction_interval
     if pi and "test_coverage" in pi:
-        lines.append(f"  {pi['coverage_target']:.0%} prediction interval: covers "
-                     f"{pi['test_coverage']:.0%} of test rows, average width "
-                     f"{pi['mean_width_original_units']:.4g}")
+        lines.append(f"  {pi['coverage_target']:.0%} {pi.get('method', 'constant')} prediction interval "
+                     f"covers {pi['test_coverage']:.0%} of test rows (average width "
+                     f"{_fmt(pi['mean_width_original_units'], '.4g')})")
+    if out.final_model_note:
+        lines.append(f"  Saved model: {out.final_model_note}")
     return "\n".join(lines)
 
 
-@tool("Quality review of pipeline")
-def quality_review_tool(_: str = "") -> str:
-    """Audit for leakage signals, overfitting, degenerate targets, dimension blow-ups.
-
-    Real target leakage almost always shows up as a SINGLE feature with
-    near-perfect correlation with the target. R²≈1.0 on both train and test
-    can also occur on highly predictable datasets (e.g. diamonds, where
-    carat, x, y, z together almost determine price), so we only flag leakage
-    confidently when both signals are present.
-    """
+def quality_findings(out) -> list[str]:
     issues: list[str] = []
-    p = STATE["profile"]; pre = STATE["preprocessing"]; results = STATE["results"]
-    df_train = STATE["df_train"]; target = STATE["target"]
-
-    # Columns the pipeline already excluded from training (auto-dropped ID/index
-    # columns, low-variance columns, the group column) shouldn't be flagged as
-    # leakage — they carry no signal into any trained model, so a high raw
-    # correlation there is a non-issue, not a red flag.
-    excluded_cols: set = set()
-    if pre is not None:
-        s = pre.summary
-        excluded_cols.update(s.get("id_like_columns_dropped") or [])
-        excluded_cols.update(s.get("low_variance_dropped") or [])
-        if s.get("group_column"):
-            excluded_cols.add(s["group_column"])
-    if STATE.get("time_column"):
-        excluded_cols.add(STATE["time_column"])
-
-    # Primary leakage signal: any single feature nearly perfectly correlated with target
-    leaked_features: list[tuple[str, float]] = []
-    if df_train is not None and target is not None:
-        for col in df_train.columns:
-            if col == target or col in excluded_cols:
-                continue
-            if pd.api.types.is_numeric_dtype(df_train[col]):
-                try:
-                    corr = abs(df_train[col].corr(df_train[target]))
-                    if not pd.isna(corr) and corr > 0.99:
-                        leaked_features.append((col, float(corr)))
-                except Exception:
-                    pass
-    if leaked_features:
-        for col, corr in sorted(leaked_features, key=lambda x: -x[1]):
-            issues.append(
-                f"Feature '{col}' has |correlation| = {corr:.4f} with target "
-                f"'{target}' — almost certainly target leakage."
-            )
-
-    if p:
-        if p["target_stats"]["std"] < 1e-9:
-            issues.append("Target has near-zero variance — regression is degenerate.")
-        if abs(p["target_stats"]["skew"]) > 2.0 and not STATE["log_transform_target"]:
-            issues.append(
-                f"Target skew is {p['target_stats']['skew']:+.2f}; consider log-transform."
-            )
-    if pre:
-        s = pre.summary
-        if s["n_features_after"] > s["n_train"]:
-            issues.append(
-                f"More features ({s['n_features_after']}) than training rows "
-                f"({s['n_train']}) — high overfitting risk; prefer regularized models."
-            )
-    if df_train is not None and target is not None:
-        y_model = pre.y_train if pre is not None else df_train[target].to_numpy(dtype=float)
-        share = target_outlier_share(y_model)
-        if share > 0.02:
-            issues.append(f"{share:.1%} of target values are extreme outliers; RMSE and R² are "
-                          "dominated by them, so the selection used "
-                          f"{STATE.get('selection_metric', 'rmse').upper()}. Judge models by "
-                          "MAE / MedianAE and consider the Huber model.")
-
-    if results:
-        best, note = _winner(results)
-        for name, r in results.items():
-            if name == BASELINE_MODEL_NAME:
-                continue
-            tr, te = r.metrics.get("R2_train"), r.metrics.get("R2")
-            tag = " (WINNER)" if name == best else ""
-            if tr is not None and te is not None and te > 0.9999 and tr > 0.9999:
-                if leaked_features:
-                    issues.append(f"{name}{tag}: R² ≈ 1.0 on both splits AND a high-correlation "
-                                  "feature was found — leakage strongly suggested.")
-                else:
-                    issues.append(f"{name}{tag}: R² ≈ 1.0 on both train and test, but no single "
-                                  "feature has > 0.99 correlation with the target — probably a "
-                                  "highly predictable dataset rather than leakage. Worth a look.")
-            if r.fit_status == "benign" and name == best:
-                issues.append(f"{name}{tag}: train/held-out gap remains, but stronger "
-                              "regularisation did not reduce held-out error (harmless gap).")
-            if r.fit_status in ("overfit", "underfit", "unstable"):
-                fixed = f" Auto-fix: {r.remediation}." if r.remediation else ""
-                issues.append(f"{name}{tag}: {r.fit_status.upper()} — "
-                              + "; ".join(r.fit_reasons) + "." + fixed)
-            if te is not None and te < 0:
-                issues.append(f"{name}{tag}: negative test R² → worse than predicting the mean.")
-        if STATE.get("split_strategy") == "time" or STATE.get("cv_strategy") == "time":
-            tree_like = [n for n in results if any(k in n for k in (
-                "Tree", "Forest", "Boost", "XGB", "LightGBM", "KNN"))]
-            bad = [n for n in tree_like if results[n].metrics.get("R2", 0) < 0]
-            if bad:
-                issues.append("Time-ordered data: " + ", ".join(bad) + " score below the mean "
-                              "on the future test period. Tree/neighbour models cannot predict "
-                              "values outside the range seen in training, so they fail on "
-                              "trending series; prefer linear models, or predict the change "
-                              "from the previous value instead of the level.")
-        w = results[best]
-        pi = w.prediction_interval
-        if pi and "test_coverage" in pi and pi["test_coverage"] < pi["coverage_target"] - 0.10:
-            issues.append(f"Winner's {pi['coverage_target']:.0%} prediction interval only covered "
-                          f"{pi['test_coverage']:.0%} of test rows — the test data may differ "
-                          "from the training data (distribution shift).")
-        if w.cv_optimistic:
-            issues.append(f"Winner {best} was tuned; its CV score comes from the search itself "
-                          "and is mildly optimistic. Rely on the test score, or enable nested CV.")
-        issues.append(f"Winner: {best} — selected by {note}; fit diagnosis: {w.fit_status}.")
-    for k, v in (STATE.get("failed_models") or {}).items():
+    pre, res = out.preprocessing, out.results
+    s = pre.summary
+    for w in out.warnings or []:
+        issues.append(f"Setup: {w}")
+    for sus in out.leakage_suspects or []:
+        tag = "LIKELY TARGET LEAKAGE" if sus["strong"] else "Very predictive single column"
+        issues.append(f"{tag}: '{sus['column']}' {sus['reason']}. If it is only known after the target "
+                      "(or is computed from it), drop it and re-run.")
+    if s.get("train_test_duplicate_rows"):
+        issues.append(f"{s['train_test_duplicate_rows']} test rows are exact copies of training rows: "
+                      "test scores are inflated.")
+    if s.get("train_val_duplicate_rows"):
+        issues.append(f"{s['train_val_duplicate_rows']} validation rows duplicate training rows.")
+    if s.get("train_test_group_overlap"):
+        issues.append(f"{s['train_test_group_overlap']} groups appear in both train and test files: the "
+                      "test measures memorisation of known groups, not generalisation to new ones.")
+    if s.get("time_order_ok") is False:
+        issues.append("The test (or validation) period starts before the training period ends: "
+                      "this is not a forward-in-time evaluation.")
+    if s.get("id_suspect_columns_kept"):
+        issues.append(f"Kept unique, sorted integer column(s) {s['id_suspect_columns_kept']}: fine if they "
+                      "are real measurements (a year, a size); drop them if they are identifiers.")
+    ts = out.profile["target_stats"]
+    if ts.get("std") is not None and np.isfinite(ts["std"]) and ts["std"] < 1e-9:
+        issues.append("Target has near-zero variance - regression is degenerate.")
+    if abs(ts.get("skew", 0.0)) > 2.0 and s["target_transform"] == "none":
+        why = (out.target_transform_decision or {}).get("method")
+        issues.append(f"Target skew is {ts['skew']:+.2f} and no log transform is applied"
+                      + (" (cross-validation found the raw scale better)." if why == "cv"
+                         else "; consider the log-transform option."))
+    if s["n_features_after"] > s["n_train"]:
+        issues.append(f"More features ({s['n_features_after']}) than training rows ({s['n_train']}): "
+                      "high overfitting risk; prefer regularised models.")
+    share = target_outlier_share(pre.y_train)
+    if share > 0.02:
+        issues.append(f"{share:.1%} of target values are extreme outliers; selection used "
+                      f"{out.selection_metric.upper()}.")
+    if out.best_model == BASELINE_MODEL_NAME:
+        issues.append("NO RELIABLE SIGNAL: " + out.selection_note)
+    for name, r in res.items():
+        if name == BASELINE_MODEL_NAME:
+            continue
+        tag = " (WINNER)" if name == out.best_model else ""
+        if r.fit_status in ("overfit", "underfit", "unstable", "cv_failed"):
+            issues.append(f"{name}{tag}: {r.fit_status.upper()} - " + "; ".join(r.fit_reasons)
+                          + (f" Auto-fix: {r.remediation}." if r.remediation else ""))
+        te = r.metrics.get("R2")
+        if te is not None and te < 0 and name == out.best_model:
+            issues.append(f"{name}{tag}: negative test R2 -> worse than predicting the mean on the test rows.")
+    if out.options_used.get("split_strategy") == "time":
+        bad = [n for n, r in res.items() if r.family in ("tree", "bagging", "boosting", "neighbors")
+               and r.metrics.get("R2", 0) < 0]
+        if bad:
+            issues.append("Time-ordered data: " + ", ".join(bad) + " score below the mean on the future "
+                          "test period. Tree / neighbour models cannot extrapolate a trend; prefer linear "
+                          "models or predict the change instead of the level.")
+    w = res[out.best_model]
+    pi = w.prediction_interval
+    if pi and "test_coverage" in pi and pi["test_coverage"] < pi["coverage_target"] - 0.10:
+        issues.append(f"The winner's {pi['coverage_target']:.0%} interval covered only "
+                      f"{pi['test_coverage']:.0%} of test rows - the test data may differ from training.")
+    if w.cv_optimistic:
+        issues.append(f"{out.best_model}'s hyperparameters were tuned on the training rows, so its CV "
+                      "score is mildly optimistic; enable nested CV for a fully honest estimate.")
+    for k, v in (out.failed_models or {}).items():
         issues.append(f"{k} failed to train and was left out: {v}")
-    red = [i for i in issues if not i.startswith("Winner:")]
-    if not red:
-        return "Quality review: no major red flags.\n  - " + "\n  - ".join(issues)
-    return "Quality review findings:\n  - " + "\n  - ".join(issues)
+    return issues
+
+
+def quality_review_text(out) -> str:
+    issues = quality_findings(out)
+    w = out.results[out.best_model]
+    tail = f"Winner: {out.best_model} - selected by {out.selection_note}; fit diagnosis: {w.fit_status}."
+    if not issues:
+        return "Quality review: no major red flags.\n  - " + tail
+    return "Quality review findings:\n  - " + "\n  - ".join(issues + [tail])
+
+
+def diagnostics_text(out) -> str:
+    d = out.winner_residual_diagnostics or {}
+    lines = [f"Residual diagnostics for the winner ({out.best_model}) on the test rows:"]
+    for k in ("n", "mean_residual", "bias_pct_of_mean_target", "hetero_spearman", "residual_skew",
+              "residual_excess_kurtosis", "share_beyond_2sd", "durbin_watson"):
+        if k in d:
+            lines.append(f"  {k}: {_fmt(d[k], '.4g')}")
+    lines += ["Findings:"] + [f"  - {f}" for f in d.get("findings", [])]
+    lines.append("Charts produced: Predicted vs Actual, Residuals vs Predicted, Residual Distribution, "
+                 "Q-Q Plot, CV R2 box (fold-consistent R2), Feature Importance (held-out permutation, "
+                 "per original column, for the winner), Learning Curve; comparison bars, CV box across "
+                 "models, training time, predicted-vs-actual overlay.")
+    return "\n".join(lines)
+
+
+def artifacts_text(out) -> str:
+    return (f"regression_pipeline.py and .ipynb: reproduce the run by calling the same library code "
+            f"as the app (utils.preprocessing.preprocess -> rebuild the winner '{out.best_model}' with its "
+            f"final settings -> evaluate on identical folds -> compare with the app's test metrics -> "
+            f"save). They need this project's utils/ folder importable (set REGRESSION_CREW_DIR). "
+            f"best_model.joblib: a raw-row feature builder + the fitted model pipeline "
+            f"({out.final_model_note or 'trained on the training rows'}); predict with "
+            f"utils.modeling.predict_with_interval(bundle, raw_rows).")
+
+
+def refinement_text(out) -> str:
+    if not out.refinement_log:
+        return "No refinement loop was run."
+    lines = ["Refinement loop (each proposal re-ran the pipeline and was kept only if CV improved):"]
+    for e in out.refinement_log:
+        lines.append(f"  - round {e['round']} [{e['source']}] {e['actions']}: "
+                     f"{'ACCEPTED' if e['accepted'] else 'rejected'} - {e['reason']}")
+    return "\n".join(lines)
+
+
+# ---- CrewAI wrappers --------------------------------------------------------------------
+
+def build_tools(out) -> dict[str, Any]:
+    """Tools bound to ONE run's output (closures - nothing shared between users)."""
+    from crewai.tools import tool
+
+    @tool("Profile dataset")
+    def profile_dataset_tool(_: str = "") -> str:
+        """Shape, column kinds, missingness, target statistics and structural findings."""
+        return profile_text(out)
+
+    @tool("Preprocess dataset")
+    def preprocess_dataset_tool(_: str = "") -> str:
+        """What preprocessing did: split, encodings, target transform and why, dropped columns."""
+        return preprocess_text(out)
+
+    @tool("Train and evaluate models")
+    def train_models_tool(_: str = "") -> str:
+        """Every model's cross-validated score on shared folds, fit diagnosis and the winner."""
+        return models_text(out)
+
+    @tool("Get best model summary")
+    def best_model_tool(_: str = "") -> str:
+        """Detailed metrics, fit diagnosis, interval and settings of the winning model."""
+        return best_model_text(out)
+
+    @tool("Quality review of pipeline")
+    def quality_review_tool(_: str = "") -> str:
+        """Leakage, overlap, over/underfitting, low-signal and interval-coverage audit."""
+        return quality_review_text(out)
+
+    @tool("Residual diagnostics")
+    def diagnostics_tool(_: str = "") -> str:
+        """Numeric summaries of the winner's residual charts, with findings."""
+        return diagnostics_text(out)
+
+    @tool("Generated artifacts")
+    def artifacts_tool(_: str = "") -> str:
+        """What the generated script, notebook and model bundle contain."""
+        return artifacts_text(out)
+
+    @tool("Refinement log")
+    def refinement_tool(_: str = "") -> str:
+        """Which improvements the advisor tried and whether cross-validation kept them."""
+        return refinement_text(out)
+
+    return {"profile": profile_dataset_tool, "preprocess": preprocess_dataset_tool,
+            "train": train_models_tool, "best": best_model_tool, "quality": quality_review_tool,
+            "diagnostics": diagnostics_tool, "artifacts": artifacts_tool, "refinement": refinement_tool}
