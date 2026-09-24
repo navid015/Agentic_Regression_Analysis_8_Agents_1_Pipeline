@@ -50,10 +50,13 @@ def build_agents(llm) -> dict[str, Agent]:
 
     modeler = Agent(
         role="ML Modeler & Evaluator",
-        goal="Train multiple regressors and identify the best by RMSE on the held-out test set.",
+        goal=("Train multiple regressors, report which ones over- or underfit and how they "
+              "were fixed, and explain why the selected winner was chosen."),
         backstory=(
-            "You believe in trying many models and letting metrics decide. "
-            "You report the top three with concrete numbers and call out overfitting."
+            "You believe in trying many models and letting honest metrics decide: "
+            "cross-validation on training rows (or a validation file) picks the winner, "
+            "the test set is only a final check. You report the top three with concrete "
+            "numbers, and always say whether each is well-fitted, overfitting or underfitting."
         ),
         tools=[train_models_tool, best_model_tool],
         llm=llm, verbose=False, allow_delegation=False,
@@ -87,8 +90,9 @@ def build_agents(llm) -> dict[str, Agent]:
 
     quality_reviewer = Agent(
         role="Quality Reviewer",
-        goal=("Audit for target leakage, overfitting, degenerate targets, and skew. "
-              "Give a clear go / caution / no-go recommendation."),
+        goal=("Audit for target leakage, overfitting, underfitting, unstable scores, "
+              "outliers, degenerate targets and skew. Give a clear go / caution / no-go "
+              "recommendation."),
         backstory="The last line of defense before a model goes live.",
         tools=[quality_review_tool],
         llm=llm, verbose=False, allow_delegation=False,
