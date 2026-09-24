@@ -104,12 +104,21 @@ def feature_importance_chart(importances, feature_names, title="Feature Importan
     return _apply_defaults(fig, height=max(380, 22 * len(df)))
 
 
+def _finite(values):
+    return [float(v) for v in (values or []) if v is not None and np.isfinite(v)]
+
+
 def cv_score_box(model_name, cv_r2) -> go.Figure | None:
-    if not cv_r2:
+    """Fold-consistent R² per fold (1 - (RMSE / std of the training target)²).
+    Per-fold R² compares each fold with its own mean and explodes on short
+    time-series folds, so the app passes the fold-consistent version."""
+    vals = _finite(cv_r2)
+    if not vals:
         return None
     fig = go.Figure()
-    fig.add_trace(go.Box(y=cv_r2, name=model_name, marker_color="#0ea5e9", boxmean=True))
-    fig.update_layout(title=f"{model_name} — CV R² distribution", yaxis_title="R² (per fold)")
+    fig.add_trace(go.Box(y=vals, name=model_name, marker_color="#0ea5e9", boxmean=True))
+    fig.update_layout(title=f"{model_name} — CV R² distribution",
+                      yaxis_title="R² per fold (fold-consistent)")
     return _apply_defaults(fig, height=360)
 
 
@@ -168,7 +177,8 @@ def metrics_comparison_bar(metrics_df, metric, ascending=True) -> go.Figure:
     df = metrics_df[["Model", metric]].sort_values(metric, ascending=ascending)
     fig = px.bar(df, x="Model", y=metric, color=metric,
                  color_continuous_scale="Viridis", text_auto=".4f")
-    fig.update_layout(title=f"Model comparison — {metric}", coloraxis_showscale=False)
+    fig.update_layout(title=f"Model comparison — test {metric} (display only; selection used CV)",
+                      coloraxis_showscale=False)
     return _apply_defaults(fig, height=420)
 
 
@@ -185,13 +195,15 @@ def all_metrics_grouped(metrics_df) -> go.Figure:
 def cv_comparison_box(results) -> go.Figure | None:
     rows = []
     for name, r in results.items():
-        for s in r.cv_scores.get("R2", []):
+        cv = r.cv_scores or {}
+        for s in _finite(cv.get("R2g") or cv.get("R2")):
             rows.append({"Model": name, "R2": s})
     if not rows:
         return None
     df = pd.DataFrame(rows)
     fig = px.box(df, x="Model", y="R2", color="Model", points="all")
-    fig.update_layout(title="Cross-validation R² — all models", showlegend=False)
+    fig.update_layout(title="Cross-validation R² (fold-consistent) — all models, same folds",
+                      showlegend=False)
     return _apply_defaults(fig, height=460)
 
 
