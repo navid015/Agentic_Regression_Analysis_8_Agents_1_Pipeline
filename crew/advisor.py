@@ -30,7 +30,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from utils.modeling import BASELINE_MODEL_NAME, _fold_errors, corrected_paired_difference
+from utils.modeling import BASELINE_MODEL_NAME, _fold_errors, corrected_paired_difference, available_model_names
 
 AUTO_ACTIONS = {
     "tuning": {"fast", "thorough"},
@@ -42,6 +42,7 @@ AUTO_ACTIONS = {
     "build_ensemble": {True, False},
 }
 CONFIRM_ACTIONS = {"drop_columns": "columns"}
+MODEL_ACTION = "selected_models"
 
 
 @dataclass
@@ -104,8 +105,10 @@ cross-validated error. You may ONLY use these actions (anything else is ignored)
 - {{"action": "high_cardinality_encoding", "value": "target" | "frequency"}}
 - {{"action": "log_transform_target", "value": "auto" | true | false}}
 - {{"action": "treat_as_categorical", "value": ["column", ...]}}   (integer codes that are categories)
+- {{"action": "selected_models", "value": ["Ridge", "RandomForest", ...]}} (available names only; baseline is always included)
+- {{"action": "build_ensemble", "value": true | false}}
 - {{"action": "drop_columns", "value": ["column", ...]}}   (ONLY for probable target leakage; a human confirms)
-Every change is tested by re-running the pipeline and kept only if CV improves.
+Each action is a separate experiment, evaluated on the locked CV protocol. Propose a hypothesis and reason for every action. Never request test labels or a different split.
 Reply with JSON only: {{"actions": [{{"action": ..., "value": ..., "reason": "..."}}]}}
 
 Available columns: {columns}
@@ -129,9 +132,15 @@ def _parse_llm_actions(text: str, valid_columns: set[str]) -> list[Proposal]:
             continue
         act, val, why = a.get("action"), a.get("value"), str(a.get("reason", ""))[:300]
         allowed = AUTO_ACTIONS.get(act, CONFIRM_ACTIONS.get(act))
+        if act == MODEL_ACTION:
+            allowed = "models"
         if allowed is None:
             continue
-        if allowed == "columns":
+        if allowed == "models":
+            if not isinstance(val, list) or not val or any(not isinstance(n, str) or n not in available_model_names() for n in val):
+                continue
+            val = list(dict.fromkeys(val))
+        elif allowed == "columns":
             if not isinstance(val, list):
                 continue
             cols = [str(c) for c in val if str(c) in valid_columns]
@@ -141,7 +150,7 @@ def _parse_llm_actions(text: str, valid_columns: set[str]) -> list[Proposal]:
         elif val not in allowed:
             continue
         out.append(Proposal(act, val, why or "suggested by the LLM advisor", source="llm",
-                            auto_ok=act in AUTO_ACTIONS))
+                            auto_ok=act in AUTO_ACTIONS or act == MODEL_ACTION))
     return out
 
 
@@ -200,14 +209,15 @@ def refine(run_fn: Callable[[dict], Any], first_out, *, rounds: int = 1,
     log: list[dict] = []
     pending: list[dict] = []
     locked_metric = first_out.selection_metric
-    for rnd in range(1, rounds + 1):
+    tried: set[str] = set()
+    for rnd in range(1, min(max(rounds, 0), 20) + 1):
         props = rule_based_proposals(best)
         if llm_call is not None:
             props += llm_proposals(best, llm_call, context_fn(best) if context_fn else "")
         uniq, seen = [], set()
         for p in props:
             key = (p.action, json.dumps(p.value, default=str))
-            if key not in seen and not _already_applied(best.run_options, p):
+            if key not in seen and key not in tried and not _already_applied(best.run_options, p):
                 seen.add(key)
                 uniq.append(p)
         for p in uniq:
@@ -216,9 +226,11 @@ def refine(run_fn: Callable[[dict], Any], first_out, *, rounds: int = 1,
         auto = [p for p in uniq if p.auto_ok]
         if not auto:
             break
-        attempts = [auto] + ([[p] for p in auto] if len(auto) > 1 else [])
+        attempts = [[p] for p in auto[:3]]
         accepted = False
-        for group in attempts[:3]:
+        for group in attempts:
+            for p in group:
+                tried.add((p.action, json.dumps(p.value, default=str)))
             if progress:
                 progress("refine", f"Refinement round {rnd}: trying {[(p.action, p.value) for p in group]}")
             opts = apply_proposals(best.run_options, group)
@@ -237,7 +249,8 @@ def refine(run_fn: Callable[[dict], Any], first_out, *, rounds: int = 1,
             if ok:
                 best, accepted = cand, True
                 break
-        if not accepted:
+        # Record rejected ideas and continue to the next hypothesis, within the budget.
+        if not accepted and llm_call is None:
             break
     best.refinement_log = (first_out.refinement_log or []) + log
     best.pending_confirmation = pending

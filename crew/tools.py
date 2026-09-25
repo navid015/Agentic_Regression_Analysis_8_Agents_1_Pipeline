@@ -266,8 +266,9 @@ def refinement_text(out) -> str:
         return "No refinement loop was run."
     lines = ["Refinement loop (each proposal re-ran the pipeline and was kept only if CV improved):"]
     for e in out.refinement_log:
-        lines.append(f"  - round {e['round']} [{e['source']}] {e['actions']}: "
-                     f"{'ACCEPTED' if e['accepted'] else 'rejected'} - {e['reason']}")
+        label = (f"agent {e['agent']} {e.get('action', 'no proposal')}"
+                 if "agent" in e else f"round {e['round']} [{e['source']}] {e['actions']}")
+        lines.append(f"  - {label}: {'ACCEPTED' if e['accepted'] else 'rejected'} - {e['reason']}")
     return "\n".join(lines)
 
 

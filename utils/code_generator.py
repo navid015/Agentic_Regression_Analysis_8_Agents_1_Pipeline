@@ -71,6 +71,8 @@ def generate_python_script(
     smearing_factor: float | None = None,
     app_test_metrics: dict | None = None,
     split_strategy: str | None = None,
+    task_spec: dict | None = None,
+    reserve_final_test: bool = False,
 ) -> str:
     if preprocess_options is None:
         preprocess_options = {
@@ -130,6 +132,8 @@ from utils.modeling import (
     train_and_evaluate,
 )
 from utils.preprocessing import preprocess
+from utils.task_contract import RegressionTask, prepare_task_frames
+from crew.laboratory import reserve_test
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -138,6 +142,8 @@ TRAIN_CSV    = {csv_path!r}
 VAL_CSV      = {val_csv_path!r}
 TEST_CSV     = {test_csv_path!r}
 TARGET       = {target!r}
+TASK_SPEC = {_literal(_jsonable(task_spec))}
+RESERVE_FINAL_TEST = {reserve_final_test!r}
 RANDOM_STATE = {random_state}
 N_FOLDS      = {cv_folds}
 CV_STRATEGY  = {cv_strategy!r}
@@ -161,6 +167,18 @@ RUN_FULL_COMPARISON = False
 df_train = read_table(TRAIN_CSV)
 df_val   = read_table(VAL_CSV) if VAL_CSV else None
 df_test  = read_table(TEST_CSV) if TEST_CSV else None
+if TASK_SPEC is not None:
+    task = RegressionTask(**TASK_SPEC)
+    if RESERVE_FINAL_TEST:
+        df_train, df_test = reserve_test(
+            df_train, test_size=PREPROCESS_OPTIONS["test_size"], seed=RANDOM_STATE,
+            split=PREPROCESS_OPTIONS["split_strategy"],
+            time_column=PREPROCESS_OPTIONS.get("time_column"),
+            group_column=PREPROCESS_OPTIONS.get("group_column"))
+    df_train, df_test = prepare_task_frames(
+        task, df_train, df_test, TARGET,
+        time_column=PREPROCESS_OPTIONS.get("time_column"),
+        group_column=PREPROCESS_OPTIONS.get("group_column"))
 print(f"Train: {{df_train.shape}}")
 
 # ---------------------------------------------------------------------

@@ -555,13 +555,14 @@ def _build_column_transformer(numeric_cols, low_card_cat, high_card_cat, *,
             ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]), list(low_card_cat)))
     if high_card_cat:
-        if high_cardinality_encoding == "frequency":
+        if high_cardinality_encoding == "frequency" or time_ordered:
             transformers.append(("freq", Pipeline([
                 ("clean", CategoricalCleaner()),
                 ("freq", FrequencyEncoder()),
                 ("scale", StandardScaler()),
             ]), list(high_card_cat)))
         else:
+            # Random/group folds only. Temporal folds use target-free frequency encoding.
             # cross-fitted: fit_transform encodes each training row with
             # statistics from OTHER folds, so a row never sees its own target
             transformers.append(("te", Pipeline([

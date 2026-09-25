@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from crew.orchestrator import PipelineOutput, run_full_pipeline
 from utils.io import read_table
+from utils.task_contract import RegressionTask
 from utils.modeling import BASELINE_MODEL_NAME, available_model_names
 from utils.visualization import (
     comparison_charts,
@@ -442,7 +443,8 @@ def on_run(
     use_agents,
     hc_encoding="Target encoding (recommended)", cat_cols_text="", drop_cols_text="",
     refit_choice="Auto (train + validation if supplied)", adaptive_intervals=True,
-    auto_refine=False, llm_advisor=False,
+    auto_refine=False, llm_advisor=False, eight_agent_mode=False,
+    available_features_text="", target_kind_choice="auto", ratio_pairs_text="", bounds_text="",
     state=None,
 ):
     """Generator: streams timeline updates while the pipeline runs on a thread."""
@@ -472,6 +474,31 @@ def on_run(
                               "❌ <b>Time-aware split needs a time column</b> — pick one under "
                               "<i>Optional: time / group columns</i> in Setup, or switch the "
                               "split strategy back to Random."),
+               state, gr.update(), *placeholders)
+        return
+
+    # The task contract is enforced before agents see data. Ratios are specified as
+    # numerator/denominator, one pair per line, using numeric source columns.
+    try:
+        ratio_pairs = []
+        for line in str(ratio_pairs_text or "").splitlines():
+            if line.strip():
+                parts = [part.strip() for part in line.split("/")]
+                if len(parts) != 2 or not all(parts):
+                    raise ValueError("Each ratio must be numerator/denominator on its own line")
+                ratio_pairs.append(tuple(parts))
+        bound_parts = [p.strip() for p in str(bounds_text or "").split(",") if p.strip()]
+        if target_kind_choice == "bounded" and len(bound_parts) != 2:
+            raise ValueError("Bounded target requires lower,upper bounds")
+        bounds = tuple(map(float, bound_parts)) if bound_parts else None
+        task = RegressionTask(
+            bounds=bounds,
+            available_features=tuple(_split_names(available_features_text)) if available_features_text.strip() else None,
+            target_kind=str(target_kind_choice).lower(),
+            ratio_features=tuple(ratio_pairs),
+        )
+    except ValueError as e:
+        yield (_status_banner("error", f"❌ <b>Invalid task definition:</b> {e}"),
                state, gr.update(), *placeholders)
         return
 
@@ -548,6 +575,7 @@ def on_run(
                              "All labelled rows (train + val + test)": "all"}.get(refit_choice, "auto"),
                 adaptive_intervals=bool(adaptive_intervals),
                 auto_refine=bool(auto_refine), use_llm_advisor=bool(llm_advisor and auto_refine),
+                eight_agent_mode=bool(eight_agent_mode), regression_task=task,
                 progress_callback=progress_cb,
                 csv_filename=state.get("train_filename") or "train.csv",
                 val_csv_filename=state.get("val_filename"),
@@ -900,11 +928,29 @@ def _run_notes_md(out) -> str:
     parts = []
     if out.warnings:
         parts.append("**Setup adjustments:**\n" + "\n".join(f"- {w}" for w in out.warnings))
+    if out.task_report:
+        report = out.task_report
+        parts.append(f"**Regression task:** {report['target_kind']} target; "
+                     f"selection by {report['objective'].upper()}. "
+                     f"Prediction-time features confirmed: {report['available_features_confirmed']}.")
+        if report.get("subgroup_error"):
+            parts.append("**Final-test subgroup/period error:** " + ", ".join(
+                f"{key}: MAE {value['mae']:.3g} (n={value['rows']})"
+                for key, value in report['subgroup_error'].items()))
+        if report.get("feature_shift_alerts"):
+            parts.append("**Final-test feature shift:** " + ", ".join(
+                f"{c} ({a['kind']}: {a['fraction']:.0%})"
+                for c, a in report['feature_shift_alerts'].items()))
     if out.refinement_log:
-        rows = [f"- round {e['round']} ({e['source']}): `{e['actions']}` → "
-                f"{'**kept**' if e['accepted'] else 'rejected'} — {e['reason']}" for e in out.refinement_log]
-        parts.append("**Refinement loop** (each change re-ran the pipeline; kept only if CV improved):\n"
-                     + "\n".join(rows))
+        rows = []
+        for e in out.refinement_log:
+            if "agent" in e:
+                rows.append(f"- {e['agent']}: `{e.get('action', 'no proposal')}` → "
+                            f"{'**kept**' if e['accepted'] else 'rejected'} — {e['reason']}")
+            else:
+                rows.append(f"- round {e['round']} ({e['source']}): `{e['actions']}` → "
+                            f"{'**kept**' if e['accepted'] else 'rejected'} — {e['reason']}")
+        parts.append("**Experiments** (changes kept only when CV improved):\n" + "\n".join(rows))
     if out.pending_confirmation:
         rows = [f"- `{p['action']}` = `{p['value']}` — {p['reason']}" for p in out.pending_confirmation]
         parts.append("**Needs your confirmation** (not applied automatically; add the column to "
@@ -1141,6 +1187,17 @@ def build_ui():
                                                                   "(whitelisted actions only)",
                                                      interactive=has_llm)
 
+                        available_features_tb = gr.Textbox(label="Features available at prediction time (comma-separated; blank assumes all)",
+                                                            placeholder="age, income, region")
+                        target_kind_dd = gr.Dropdown(["auto", "continuous", "count", "positive", "nonnegative", "bounded"],
+                                                     value="auto", label="Target type for eight-agent mode")
+                        ratios_tb = gr.Textbox(label="Safe numeric ratios (optional, one numerator/denominator per line)",
+                                               lines=2, placeholder="income/household_size")
+                        bounds_tb = gr.Textbox(label="Bounds for bounded target (lower,upper)",
+                                               placeholder="0,100")
+                        eight_agent_cb = gr.Checkbox(False,
+                            label="Eight independent regression specialists (experimental; reserves final test)",
+                            interactive=has_llm)
                         gr.Markdown("### 6. CrewAI agent narration")
                         if has_llm:
                             gr.HTML(f'<div class="scope-good">✅ <b>{llm_provider}</b> '
@@ -1318,7 +1375,8 @@ def build_ui():
             tuning_radio, selection_radio, auto_fix_cb, ensemble_cb, one_se_cb,
             interact_cb, nested_cb, use_agents_cb,
             hc_encoding_radio, cat_cols_tb, drop_cols_tb, refit_radio, adaptive_cb,
-            refine_cb, llm_advisor_cb, state,
+            refine_cb, llm_advisor_cb, eight_agent_cb,
+            available_features_tb, target_kind_dd, ratios_tb, bounds_tb, state,
         ]
 
         # Keep the placeholder count in lockstep with the real component list.

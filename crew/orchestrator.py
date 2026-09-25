@@ -93,6 +93,7 @@ class PipelineOutput:
     pending_confirmation: list[dict] = field(default_factory=list)
     run_options: dict = field(default_factory=dict)
     run_inputs: dict = field(default_factory=dict)
+    task_report: dict = field(default_factory=dict)
 
 
 # ---- LLM ------------------------------------------------------------------------------
@@ -237,7 +238,8 @@ def _run_once(df_train, df_val, df_test, target: str, o: dict, progress_callback
 
     zoo = get_default_model_zoo(rs, time_ordered=cv_strategy == "time", target_transform=log_t)
     if o.get("selected_models"):
-        zoo = {k: v for k, v in zoo.items() if k in o["selected_models"]}
+        zoo = {k: v for k, v in zoo.items()
+               if k == BASELINE_MODEL_NAME or k in o["selected_models"]}
     zoo, skipped = filter_zoo_for_data(zoo, pre.y_train_original, target_transform=log_t)
     if not zoo:
         raise ValueError("None of the selected models can be used on this dataset: "
@@ -349,6 +351,7 @@ def _run_once(df_train, df_val, df_test, target: str, o: dict, progress_callback
         interval=interval_literal, smearing_factor=winner.smearing_factor,
         app_test_metrics=winner.metrics, split_strategy=split_strategy,
         preprocess_options={**pre_kwargs, "log_transform_target": log_t == "log1p"},
+        task_spec=o.get("task_spec"), reserve_final_test=o.get("reserve_final_test", False),
     )
     script, nb = generate_python_script(**gen_kwargs), generate_notebook(**gen_kwargs)
     script_path, nb_path = Path(out_dir) / "regression_pipeline.py", Path(out_dir) / "regression_pipeline.ipynb"
@@ -363,6 +366,8 @@ def _run_once(df_train, df_val, df_test, target: str, o: dict, progress_callback
             "model_name": best, "target": target, "target_transform": log_t,
             "smearing_factor": winner.smearing_factor,
             "raw_feature_columns": list(pre.X_train_raw.columns),
+            "task_spec": o.get("task_spec"),
+            "task_input_columns": o.get("task_input_columns"),
             "feature_names": pre.feature_names, "selection_basis": basis, "selection_metric": metric,
             "selection_note": note, "fit_status": winner.fit_status, "metrics": winner.metrics,
             "best_params": winner.best_params, "prediction_interval": winner.prediction_interval,
@@ -406,6 +411,22 @@ def _run_once(df_train, df_val, df_test, target: str, o: dict, progress_callback
 
 
 # ---- public entry point --------------------------------------------------------------------------
+
+def _experiment_context(out: PipelineOutput) -> str:
+    """Only training profile and CV scores enter the experiment planner prompt."""
+    metric = out.selection_metric.upper()
+    rows = sorted(
+        ((name, result.metrics.get(f"CV_{metric}_mean")) for name, result in out.results.items()),
+        key=lambda row: float("inf") if row[1] is None else row[1],
+    )
+    scores = ", ".join(f"{name}: {score:.4g}" for name, score in rows
+                       if score is not None and np.isfinite(score))
+    history = out.refinement_log[-10:] if out.refinement_log else []
+    return (f"Training data: {out.profile['n_rows']} rows, {out.profile['n_cols']} columns; "
+            f"CV metric: {metric}; CV scores: {scores}. "
+            f"Missing cells: {out.profile.get('missing_total', 0)}. "
+            f"Previous experiments: {history}")
+
 
 def run_full_pipeline(
     *,
@@ -454,24 +475,33 @@ def run_full_pipeline(
     auto_refine: bool = False,
     refine_rounds: int = 1,
     use_llm_advisor: bool = False,
+    eight_agent_mode: bool = False,
+    regression_task=None,
     output_dir: str | None = None,
     n_jobs: int = -1,
 ) -> PipelineOutput:
     _args = dict(locals())
     options = {k: v for k, v in _args.items()
                if k not in ("df_train", "df_val", "df_test", "target", "progress_callback",
-                            "use_agents", "auto_refine", "refine_rounds", "use_llm_advisor")}
+                            "use_agents", "auto_refine", "refine_rounds", "use_llm_advisor", "eight_agent_mode", "regression_task") }
 
     def run(opts):
         return _run_once(df_train, df_val, df_test, target, opts, progress_callback)
+
+    if eight_agent_mode:
+        from .laboratory import run_eight_agent_pipeline
+        out = run_eight_agent_pipeline(df_train=df_train, df_test=df_test, df_val=df_val,
+                                       target=target, task=regression_task, progress_callback=progress_callback,
+                                       **options)
+        if use_agents:
+            out.crew_narrative, out.agent_outputs = _run_crew_narration(out, progress_callback)
+        return out
 
     out = run(options)
     if auto_refine:
         llm_call = _llm_call_fn() if use_llm_advisor else None
         out = crew_advisor.refine(run, out, rounds=refine_rounds, llm_call=llm_call,
-                                  context_fn=lambda o: "\n\n".join([
-                                      crew_tools.models_text(o), crew_tools.quality_review_text(o),
-                                      crew_tools.preprocess_text(o)]),
+                                  context_fn=_experiment_context,
                                   progress=progress_callback)
     else:
         out.pending_confirmation = [p.as_dict() for p in crew_advisor.rule_based_proposals(out)

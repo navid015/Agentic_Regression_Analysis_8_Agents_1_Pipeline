@@ -16,8 +16,8 @@ What changed and why
 * **Selection uses a corrected paired test** (Nadeau & Bengio's corrected
   resampled t-test) for the one-standard-error rule, for accepting automatic
   fixes, and for a new **"no reliable signal" check**: if the best model is not
-  significantly better than predicting the mean (Bonferroni-corrected for the
-  number of models tried), the baseline wins and the app says so.
+  significantly better than predicting the mean (compared to the
+  baseline with a multiple-comparison correction), the baseline wins and the app says so.
 * **A model whose CV fails is excluded and reported** - selection never falls
   back silently to the test set.
 * **Relative fit diagnosis.** A flexible "capacity probe" (gradient boosting)
@@ -63,6 +63,8 @@ from sklearn.ensemble import (
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import (
     ElasticNet,
+    GammaRegressor,
+    TweedieRegressor,
     HuberRegressor,
     Lasso,
     LinearRegression,
@@ -180,7 +182,7 @@ LEGACY_ENSEMBLE_NAME = "Ensemble (top-3 average)"
 COMPLEXITY = {
     BASELINE_MODEL_NAME: 0,
     "LinearRegression": 1, "Ridge": 1, "Lasso": 1, "ElasticNet": 1,
-    "Huber": 1, "PoissonRegressor": 1,
+    "Huber": 1, "PoissonRegressor": 1, "GammaRegressor": 1, "TweedieRegressor": 1,
     "KNN": 2, "DecisionTree": 2, "SVR": 3,
     "RandomForest": 4, "ExtraTrees": 4,
     "GradientBoosting": 5, "HistGradientBoosting": 5, "XGBoost": 5, "LightGBM": 5,
@@ -191,6 +193,7 @@ FAMILY = {
     BASELINE_MODEL_NAME: "baseline",
     "LinearRegression": "linear", "Ridge": "linear", "Lasso": "linear", "ElasticNet": "linear",
     "Huber": "linear", "PoissonRegressor": "linear",
+    "GammaRegressor": "linear", "TweedieRegressor": "linear",
     "DecisionTree": "tree", "RandomForest": "bagging", "ExtraTrees": "bagging",
     "GradientBoosting": "boosting", "HistGradientBoosting": "boosting",
     "XGBoost": "boosting", "LightGBM": "boosting",
@@ -345,6 +348,8 @@ def get_default_model_zoo(random_state: int = 42, *, time_ordered: bool = False,
         "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, random_state=rs, max_iter=20000),
         "Huber": HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=2000),
         "PoissonRegressor": PoissonRegressor(alpha=1e-3, max_iter=2000),
+        "GammaRegressor": GammaRegressor(alpha=1e-3, max_iter=2000),
+        "TweedieRegressor": TweedieRegressor(power=1.5, alpha=1e-3, link="log", max_iter=2000),
         "DecisionTree": DecisionTreeRegressor(max_depth=12, min_samples_leaf=5, random_state=rs),
         "RandomForest": RandomForestRegressor(n_estimators=300, min_samples_leaf=2,
                                               random_state=rs, n_jobs=1),
@@ -384,7 +389,7 @@ def get_default_model_zoo(random_state: int = 42, *, time_ordered: bool = False,
                           verbosity=-1),
             time_ordered=time_ordered, random_state=rs)
     order = [BASELINE_MODEL_NAME, "LinearRegression", "Ridge", "Lasso", "ElasticNet", "Huber",
-             "PoissonRegressor", "DecisionTree", "RandomForest", "ExtraTrees", "GradientBoosting",
+             "PoissonRegressor", "GammaRegressor", "TweedieRegressor", "DecisionTree", "RandomForest", "ExtraTrees", "GradientBoosting",
              "HistGradientBoosting", "KNN", "SVR", "XGBoost", "LightGBM"]
     return {n: (_scaled(zoo[n]) if n in TARGET_SCALED else zoo[n]) for n in order if n in zoo}
 
@@ -399,11 +404,14 @@ def filter_zoo_for_data(zoo: dict[str, Any], y_train: np.ndarray, *,
     kept, skipped = {}, {}
     n = len(y_train)
     for name, est in zoo.items():
-        if name == "PoissonRegressor":
+        if name in ("PoissonRegressor", "GammaRegressor", "TweedieRegressor"):
+            if name in ("GammaRegressor", "TweedieRegressor") and np.nanmin(y_train) <= 0:
+                skipped[name] = "needs a strictly positive target"
+                continue
             if target_transform != "none":
                 skipped[name] = "not used with a log-transformed target (Poisson already models log-scale)"
                 continue
-            if np.nanmin(y_train) < 0:
+            if name == "PoissonRegressor" and np.nanmin(y_train) < 0:
                 skipped[name] = "needs a non-negative target (counts, amounts, durations)"
                 continue
         if name == "SVR" and n > SVR_MAX_ROWS:
@@ -548,6 +556,8 @@ def _search_space(name: str, min_train_rows: int, n_splits: int = 5) -> dict[str
         "ElasticNet": {"alpha": loguniform(1e-4, 10), "l1_ratio": uniform(0.05, 0.9)},
         "Huber": {"epsilon": uniform(1.1, 1.0), "alpha": loguniform(1e-6, 1)},
         "PoissonRegressor": {"alpha": loguniform(1e-6, 10)},
+        "GammaRegressor": {"alpha": loguniform(1e-6, 10)},
+        "TweedieRegressor": {"alpha": loguniform(1e-6, 10), "power": uniform(1.01, .98)},
         "DecisionTree": {"max_depth": [3, 5, 8, 12, 20, None], "min_samples_leaf": randint(1, 40),
                          "max_features": [1.0, 0.8, 0.6]},
         "RandomForest": {"n_estimators": [200, 400], "max_depth": [None, 8, 16, 24],
@@ -1325,17 +1335,18 @@ def explain_selection(results: dict[str, ModelResult], *, one_se_rule: bool = Tr
     base = results.get(BASELINE_MODEL_NAME)
     if no_signal_check and base is not None and winner != BASELINE_MODEL_NAME:
         if basis == "cv" and _cv_complete(base):
-            eb, ew = _fold_errors(base, M), _fold_errors(best, M)
+            selected = results[winner]
+            eb, ew = _fold_errors(base, M), _fold_errors(selected, M)
             base_err = base.metrics.get(key, math.inf)
-            skill = 1.0 - best.metrics.get(key, math.inf) / base_err if base_err > 0 else 0.0
+            skill = 1.0 - selected.metrics.get(key, math.inf) / base_err if base_err > 0 else 0.0
             significant = False
             if eb is not None and ew is not None and ratio is not None and len(eb) == len(ew):
                 gain, se, k = corrected_paired_difference(eb, ew, ratio)
-                tcrit = float(student_t.ppf(1 - NO_SIGNAL_ALPHA, df=max(k - 1, 1)))
+                tcrit = float(student_t.ppf(1 - NO_SIGNAL_ALPHA / max(len(cands), 1), df=max(k - 1, 1)))
                 significant = bool(se > 0 and np.isfinite(se) and gain > tcrit * se)
             if skill <= NO_SIGNAL_MIN_SKILL or (skill < UNDERFIT_MIN_SKILL and not significant):
                 return BASELINE_MODEL_NAME, (
-                    f"no reliable signal: the best model ({best_name}) is only {skill:.1%} better than "
+                    f"no reliable signal: the selected model ({winner}) is only {skill:.1%} better than "
                     f"predicting the mean in cross-validation"
                     + ("" if skill <= NO_SIGNAL_MIN_SKILL else ", and that gain is within fold-to-fold noise")
                     + ". The baseline is reported as the honest answer; more rows or more informative "
@@ -1591,6 +1602,10 @@ def compute_prediction_interval(estimator, X, y, *, cv_strategy="kfold", cv_fold
 
 def predict_with_interval(bundle: dict, X_raw) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """For users of best_model.joblib: (prediction, lower, upper) in original units."""
+    if bundle.get("task_spec") is not None:
+        from utils.task_contract import RegressionTask, apply_feature_contract
+        task = RegressionTask(**bundle["task_spec"])
+        X_raw = apply_feature_contract(task, X_raw, bundle["task_input_columns"])
     X = bundle["preprocessor"].transform(X_raw)
     p = np.asarray(bundle["model"].predict(X), float)
     pi = bundle.get("prediction_interval") or {}

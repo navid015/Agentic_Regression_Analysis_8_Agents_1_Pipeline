@@ -30,7 +30,7 @@ notebook and a model file that reproduce the run exactly.
 | Stage | What happens |
 | --- | --- |
 | **Same folds for everyone** | Folds are built once; every model (tuned or not, and the baseline) is scored on exactly those folds, so comparisons are *paired* |
-| **No leakage into CV** | Imputation, scaling and target encoding are fitted inside each training fold |
+| **No leakage into CV** | Imputation, scaling and categorical encoding are fitted inside each training fold |
 | **Tuning ≠ scoring** | Hyperparameter search uses reshuffled folds; the reported CV score comes from the shared folds (optional nested CV for fully unbiased estimates) |
 | **Relative diagnosis** | Each model is labelled *good*, *harmless gap*, *overfit*, *underfit*, *unstable* or *low-signal* from training CV only. "Underfit" requires that another model (or a flexible reference model) does clearly better; if nothing does, the data are *low-signal* and no capacity is added |
 | **Fixes must be real** | A remedy is kept only if it lowers CV error by more than the corrected fold-to-fold noise (Nadeau–Bengio corrected resampled t-test) |
@@ -52,7 +52,7 @@ fixed budget because sklearn's internal validation split is random.
   validated with time-series CV), or group-aware (no group on both sides)
 - **Target transform:** *auto* compares raw vs `log1p` by cross-validation in original units;
   log-target predictions get a smearing bias correction when that lowers out-of-fold RMSE
-- **Categoricals:** cross-fitted target encoding for > 20 levels (or frequency encoding);
+- **Categoricals:** cross-fitted target encoding for > 20 levels (frequency encoding for temporal data);
   "treat as categorical" for integer codes; "drop columns" for suspected leakage
 - **Tuning:** Off / Fast / Thorough; **selection metric:** auto (MAE when the target has heavy
   outliers), RMSE or MAE
@@ -144,3 +144,15 @@ other's results. Without an LLM key everything except narration and LLM proposal
   tiny datasets (< 50 rows); nested CV, Thorough tuning and auto-refine multiply run time
 - **Not designed for:** classification, multi-output, quantile or survival regression,
   images / text / audio, deployment infrastructure, causal inference
+
+## Agent-driven experiments
+
+See [AUTONOMOUS_EXPERIMENTS.md](AUTONOMOUS_EXPERIMENTS.md) for the bounded experiment loop, setup, and limits.
+
+## Eight-agent experimental mode
+
+Enable the **Eight independent regression specialists** checkbox in Setup or pass `eight_agent_mode=True` to `run_full_pipeline`. See [EIGHT_AGENT_MODE.md](EIGHT_AGENT_MODE.md) for agent roles, the locked final test, and setup.
+
+## Broader regression tasks
+
+See [BROADER_REGRESSION_GUIDE.md](BROADER_REGRESSION_GUIDE.md) for the prediction-time feature contract, target-aware candidates, safe numeric ratios, drift alerts, and current limits.
